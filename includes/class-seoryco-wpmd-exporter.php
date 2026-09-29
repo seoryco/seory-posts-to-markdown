@@ -93,6 +93,18 @@ class Seoryco_Wpmd_Exporter {
 	}
 
 	/**
+	 * Public access to the HTML that convert_post() would convert (used by the abilities).
+	 *
+	 * @since 0.2
+	 *
+	 * @param WP_Post $post Post.
+	 * @return string
+	 */
+	public function get_content_html( $post ) {
+		return $this->content_html( $post );
+	}
+
+	/**
 	 * Get the HTML to convert, honoring the content rendering mode.
 	 *
 	 * @param WP_Post $post Post.
