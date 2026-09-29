@@ -1156,12 +1156,19 @@ function seoryco_wpmd_ability_get_post_markdown( $input = null ) {
 		}
 
 		// A read-only GET must not fetch embeds or write the oEmbed cache (the ZIP export is not affected).
+		// Embeds stay as their URL, written into the Markdown exactly as in the post.
 		$file = seoryco_wpmd_ability_without_oembed(
 			static function () use ( $exporter, $args ) {
 				$used_paths = array();
 
-				return $exporter->convert_post( $args['id'], $used_paths );
-			}
+				$file = $exporter->convert_post( $args['id'], $used_paths );
+				if ( is_array( $file ) && isset( $file['content'] ) ) {
+					$file['content'] = seoryco_wpmd_ability_restore_embed_urls( $file['content'] );
+				}
+
+				return $file;
+			},
+			true
 		);
 		if ( is_wp_error( $file ) ) {
 			return new WP_Error(
@@ -1291,16 +1298,25 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
  */
 
 /**
- * Shared state of the oEmbed suspension: nesting depth and the WP_Embed
- * filters removed by the outermost call.
+ * Shared state of the oEmbed suspension.
  *
- * @return array { depth: int, removed: array, embed_shortcode: callable|null }
+ * - depth: nesting depth of seoryco_wpmd_ability_without_oembed().
+ * - removed: WP_Embed `the_content` filters removed by the outermost call, each
+ *   with its priority and the stand-in filter added in its place.
+ * - embed_shortcode: the `[embed]` handler before the outermost call (null if none).
+ * - collectors: one entry per nested call, innermost last. null for a call that
+ *   reads the rendered HTML as text (list-external-links); an array for a call that
+ *   converts it to Markdown (get-post-markdown), holding the placeholders that
+ *   stand for embed URLs until the Markdown is written.
+ *
+ * @return array
  */
 function &seoryco_wpmd_ability_oembed_state() {
 	static $state = array(
 		'depth'           => 0,
 		'removed'         => array(),
 		'embed_shortcode' => null,
+		'collectors'      => array(),
 	);
 
 	return $state;
@@ -1315,15 +1331,33 @@ function &seoryco_wpmd_ability_oembed_state() {
  * `the_content` filter runs an ability while one is already rendering): only the
  * outermost call turns oEmbed back on, also when the callback throws.
  *
- * @param callable $callback Callback.
+ * Embeds are left as their URL. With $for_markdown, the URL is rendered as a
+ * placeholder that the callback swaps back with seoryco_wpmd_ability_restore_embed_urls()
+ * after the Markdown conversion, so the Markdown holds the URL exactly as written
+ * (the converter would otherwise write `&` as `&amp;` and escape `_`).
+ *
+ * @param callable $callback     Callback.
+ * @param bool     $for_markdown Whether the callback converts the rendered HTML to Markdown.
  * @return mixed The callback's return value.
  */
-function seoryco_wpmd_ability_without_oembed( callable $callback ) {
+function seoryco_wpmd_ability_without_oembed( callable $callback, $for_markdown = false ) {
+	$state  = &seoryco_wpmd_ability_oembed_state();
+	$pushed = false;
+
 	try {
 		seoryco_wpmd_ability_suspend_oembed();
 
+		$state['collectors'][] = $for_markdown ? array(
+			'prefix' => 'seorycowpmdembed' . wp_generate_password( 16, false ),
+			'urls'   => array(),
+		) : null;
+		$pushed                = true;
+
 		return $callback();
 	} finally {
+		if ( $pushed ) {
+			array_pop( $state['collectors'] );
+		}
 		seoryco_wpmd_ability_restore_oembed();
 	}
 }
@@ -1332,14 +1366,16 @@ function seoryco_wpmd_ability_without_oembed( callable $callback ) {
  * Turn off oEmbed (nestable; see seoryco_wpmd_ability_without_oembed()).
  *
  * On the outermost call:
- * - Removes WP_Embed's `the_content` filters (run_shortcode, autoembed), which
- *   are the normal path for embeds in post content.
+ * - Replaces WP_Embed's `the_content` filters (run_shortcode, autoembed), which
+ *   are the normal path for embeds in post content, with stand-ins at the same
+ *   priority that leave each embed as its URL (seoryco_wpmd_ability_run_embed_shortcode(),
+ *   seoryco_wpmd_ability_autoembed_as_url()).
  * - Short-circuits any remaining oEmbed request (e.g. core blocks that call
  *   WP_Embed::autoembed() or wp_oembed_get() directly), so no HTTP request is made.
  * - Blocks writes of `_oembed_*` post meta, so the oEmbed cache is not changed.
  * - Points the `[embed]` shortcode (normally only a placeholder that outputs
- *   nothing outside WP_Embed::run_shortcode()) at a handler that outputs the URL
- *   as text, so every embed stays as its plain URL instead of disappearing.
+ *   nothing outside WP_Embed::run_shortcode()) at a handler that outputs the URL,
+ *   so every embed stays as its plain URL instead of disappearing.
  *
  * Inner calls only increase the depth. Every call must be paired with
  * seoryco_wpmd_ability_restore_oembed() in a finally block.
@@ -1355,11 +1391,16 @@ function seoryco_wpmd_ability_suspend_oembed() {
 
 	$state['removed'] = array();
 	if ( $wp_embed instanceof WP_Embed ) {
-		foreach ( array( 'run_shortcode', 'autoembed' ) as $method ) {
+		$stand_ins = array(
+			'run_shortcode' => 'seoryco_wpmd_ability_run_embed_shortcode',
+			'autoembed'     => 'seoryco_wpmd_ability_autoembed_as_url',
+		);
+		foreach ( $stand_ins as $method => $stand_in ) {
 			$priority = has_filter( 'the_content', array( $wp_embed, $method ) );
 			if ( false !== $priority ) {
 				remove_filter( 'the_content', array( $wp_embed, $method ), $priority );
-				$state['removed'][] = array( $method, $priority );
+				add_filter( 'the_content', $stand_in, $priority );
+				$state['removed'][] = array( $method, $priority, $stand_in );
 			}
 		}
 	}
@@ -1374,6 +1415,10 @@ function seoryco_wpmd_ability_suspend_oembed() {
 
 /**
  * Undo seoryco_wpmd_ability_suspend_oembed(). Only the outermost call restores.
+ *
+ * The `[embed]` handler is put back only if it is still this plugin's stand-in:
+ * a handler that another plugin registered while the content was rendering is
+ * left in place.
  */
 function seoryco_wpmd_ability_restore_oembed() {
 	global $wp_embed;
@@ -1392,15 +1437,19 @@ function seoryco_wpmd_ability_restore_oembed() {
 	remove_filter( 'update_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
 	remove_filter( 'add_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
 
-	if ( null !== $state['embed_shortcode'] ) {
-		add_shortcode( 'embed', $state['embed_shortcode'] );
-	} else {
-		remove_shortcode( 'embed' );
+	$current = isset( $GLOBALS['shortcode_tags']['embed'] ) ? $GLOBALS['shortcode_tags']['embed'] : null;
+	if ( 'seoryco_wpmd_ability_embed_as_url' === $current ) {
+		if ( null !== $state['embed_shortcode'] ) {
+			add_shortcode( 'embed', $state['embed_shortcode'] );
+		} else {
+			remove_shortcode( 'embed' );
+		}
 	}
 	$state['embed_shortcode'] = null;
 
-	if ( $wp_embed instanceof WP_Embed ) {
-		foreach ( $state['removed'] as $filter ) {
+	foreach ( $state['removed'] as $filter ) {
+		remove_filter( 'the_content', $filter[2], $filter[1] );
+		if ( $wp_embed instanceof WP_Embed ) {
 			add_filter( 'the_content', array( $wp_embed, $filter[0] ), $filter[1] );
 		}
 	}
@@ -1408,7 +1457,76 @@ function seoryco_wpmd_ability_restore_oembed() {
 }
 
 /**
- * `[embed]` shortcode while oEmbed is suspended: the URL as plain text.
+ * Stand-in for WP_Embed::run_shortcode() while oEmbed is suspended.
+ *
+ * Only acts for get-post-markdown (see seoryco_wpmd_ability_without_oembed()):
+ * runs only the `[embed]` shortcode, at the same point as core (before
+ * wpautop()), so a stand-alone `[embed]` becomes a paragraph of its own. For
+ * list-external-links the content is returned unchanged, and `[embed]` is
+ * handled later with the other shortcodes.
+ *
+ * @param string $content Post content.
+ * @return string
+ */
+function seoryco_wpmd_ability_run_embed_shortcode( $content ) {
+	$state      = &seoryco_wpmd_ability_oembed_state();
+	$collectors = $state['collectors'];
+	$content    = (string) $content;
+	if ( ! is_array( end( $collectors ) ) || false === strpos( $content, '[embed' ) ) {
+		return $content;
+	}
+
+	$pattern = get_shortcode_regex( array( 'embed' ) );
+	$result  = preg_replace_callback( "/$pattern/", 'do_shortcode_tag', $content );
+
+	return null === $result ? $content : $result;
+}
+
+/**
+ * Stand-in for WP_Embed::autoembed() while oEmbed is suspended.
+ *
+ * Only acts for get-post-markdown (see seoryco_wpmd_ability_without_oembed()):
+ * a URL on its own line or in its own paragraph (the same patterns as core,
+ * which also covers the URL inside an embed block) is replaced with a
+ * placeholder, so the Markdown gets the URL exactly as written. For
+ * list-external-links the content is returned unchanged.
+ *
+ * @param string $content Post content.
+ * @return string
+ */
+function seoryco_wpmd_ability_autoembed_as_url( $content ) {
+	$state      = &seoryco_wpmd_ability_oembed_state();
+	$collectors = $state['collectors'];
+	if ( ! is_array( end( $collectors ) ) ) {
+		return $content;
+	}
+
+	// Same steps as WP_Embed::autoembed(), without contacting any provider.
+	$content = wp_replace_in_html_tags( (string) $content, array( "\n" => '<!-- wp-line-break -->' ) );
+	if ( preg_match( '#(^|\s|>)https?://#i', $content ) ) {
+		foreach ( array( '|^(\s*)(https?://[^\s<>"]+)(\s*)$|im', '|(<p(?: [^>]*)?>\s*)(https?://[^\s<>"]+)(\s*<\/p>)|i' ) as $pattern ) {
+			$result = preg_replace_callback( $pattern, 'seoryco_wpmd_ability_autoembed_callback', $content );
+			if ( null !== $result ) {
+				$content = $result;
+			}
+		}
+	}
+
+	return str_replace( '<!-- wp-line-break -->', "\n", $content );
+}
+
+/**
+ * Callback for seoryco_wpmd_ability_autoembed_as_url().
+ *
+ * @param array $matches Leading space, URL, trailing space.
+ * @return string
+ */
+function seoryco_wpmd_ability_autoembed_callback( $matches ) {
+	return $matches[1] . seoryco_wpmd_ability_embed_text( $matches[2] ) . $matches[3];
+}
+
+/**
+ * `[embed]` shortcode while oEmbed is suspended: the URL instead of the embed.
  *
  * @param array|string $attr    Shortcode attributes.
  * @param string       $content URL between the tags.
@@ -1420,7 +1538,74 @@ function seoryco_wpmd_ability_embed_as_url( $attr, $content = '' ) {
 		$url = trim( (string) $attr['src'] );
 	}
 
+	return seoryco_wpmd_ability_embed_text( $url );
+}
+
+/**
+ * HTML that stands for an embed URL while oEmbed is suspended.
+ *
+ * The URL is taken as written (HTML character references such as `&amp;` or
+ * `&#038;`, added by the editor or by wptexturize(), are decoded). For
+ * get-post-markdown, a URL that is safe to write into Markdown as is becomes a
+ * placeholder (letters and digits only, so no content filter or the Markdown
+ * converter changes it), replaced with the URL after the conversion. Anything
+ * else, and all URLs for list-external-links, is returned as escaped text.
+ *
+ * @param string $url URL.
+ * @return string
+ */
+function seoryco_wpmd_ability_embed_text( $url ) {
+	$url   = trim( wp_specialchars_decode( trim( (string) $url ), ENT_QUOTES ) );
+	$state = &seoryco_wpmd_ability_oembed_state();
+	$top   = count( $state['collectors'] ) - 1;
+
+	if ( $top >= 0 && is_array( $state['collectors'][ $top ] ) && seoryco_wpmd_ability_is_plain_url( $url ) ) {
+		$token = $state['collectors'][ $top ]['prefix'] . sprintf( '%06d', count( $state['collectors'][ $top ]['urls'] ) );
+
+		$state['collectors'][ $top ]['urls'][ $token ] = $url;
+
+		return $token;
+	}
+
 	return esc_html( $url );
+}
+
+/**
+ * Whether a URL can be written into Markdown unchanged.
+ *
+ * An http(s) URL without whitespace, control characters, or characters that
+ * Markdown or HTML would read as markup (`<`, `>`, `"`, backtick, backslash, a
+ * `](` link opener, or an HTML character reference).
+ *
+ * @param string $url URL.
+ * @return bool
+ */
+function seoryco_wpmd_ability_is_plain_url( $url ) {
+	$url = (string) $url;
+
+	return 1 === preg_match( '#^https?://[^\s<>"`\\\\\x00-\x1F\x7F]+$#iu', $url )
+		&& false === strpos( $url, '](' )
+		&& 1 !== preg_match( '/&(?:[a-z][a-z0-9]*|#[0-9]+|#x[0-9a-f]+);/i', $url );
+}
+
+/**
+ * Put the embed URLs back into Markdown made while oEmbed was suspended with
+ * $for_markdown (see seoryco_wpmd_ability_without_oembed()). Must be called from
+ * inside that callback.
+ *
+ * @param string $markdown Markdown.
+ * @return string
+ */
+function seoryco_wpmd_ability_restore_embed_urls( $markdown ) {
+	$state      = &seoryco_wpmd_ability_oembed_state();
+	$collectors = $state['collectors'];
+	$top        = end( $collectors );
+
+	if ( ! is_array( $top ) || empty( $top['urls'] ) ) {
+		return (string) $markdown;
+	}
+
+	return strtr( (string) $markdown, $top['urls'] );
 }
 
 /**
