@@ -1,0 +1,172 @@
+.seoryco-wpmd {
+	max-width: 760px;
+}
+
+.seoryco-wpmd-intro {
+	font-size: 14px;
+	margin-bottom: 16px;
+}
+
+.seoryco-wpmd-card {
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 8px;
+	box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+	margin: 0 0 16px;
+	padding: 16px 20px;
+}
+
+.seoryco-wpmd-card h2 {
+	font-size: 14px;
+	margin: 0 0 12px;
+}
+
+.seoryco-wpmd-label {
+	display: block;
+	font-weight: 600;
+	margin-bottom: 6px;
+}
+
+.seoryco-wpmd-inline {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	margin: 0 16px 8px 0;
+}
+
+.seoryco-wpmd-inline code {
+	font-size: 11px;
+}
+
+.seoryco-wpmd-option {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	margin: 0 0 12px;
+}
+
+.seoryco-wpmd-option input {
+	margin-top: 3px;
+}
+
+.seoryco-wpmd-option-title {
+	display: block;
+}
+
+.seoryco-wpmd-help {
+	color: #646970;
+	display: block;
+	font-size: 12px;
+	margin-top: 2px;
+}
+
+.seoryco-wpmd-field {
+	display: block;
+	margin: 0 0 12px;
+}
+
+.seoryco-wpmd-type {
+	border: 1px solid #e2e4e7;
+	border-radius: 6px;
+	margin: 0 0 10px;
+	padding: 10px 14px;
+}
+
+.seoryco-wpmd-type .seoryco-wpmd-inline {
+	margin: 0;
+}
+
+.seoryco-wpmd-type-name {
+	font-weight: 600;
+}
+
+.seoryco-wpmd-type-filters {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 20px;
+	margin: 8px 0 0 24px;
+}
+
+.seoryco-wpmd-type-filters .seoryco-wpmd-field {
+	margin: 0;
+}
+
+.seoryco-wpmd-type-filters .seoryco-wpmd-label {
+	font-weight: 400;
+	color: #646970;
+	font-size: 12px;
+	margin-bottom: 2px;
+}
+
+.seoryco-wpmd-type.is-disabled {
+	opacity: 0.55;
+}
+
+.seoryco-wpmd-dates {
+	display: flex;
+	gap: 16px;
+}
+
+.seoryco-wpmd-progress-track {
+	background: #f0f0f1;
+	border-radius: 999px;
+	height: 8px;
+	overflow: hidden;
+}
+
+.seoryco-wpmd-progress-bar {
+	background: #2271b1;
+	height: 100%;
+	transition: width 0.2s ease;
+}
+
+.seoryco-wpmd-progress-text {
+	color: #646970;
+	margin: 8px 0 0;
+}
+
+.seoryco-wpmd-stats {
+	display: grid;
+	gap: 12px;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.seoryco-wpmd-stat {
+	background: #f6f7f7;
+	border-radius: 6px;
+	padding: 10px 12px;
+}
+
+.seoryco-wpmd-stat-label {
+	color: #646970;
+	display: block;
+	font-size: 12px;
+}
+
+.seoryco-wpmd-stat-value {
+	display: block;
+	font-size: 22px;
+	font-weight: 600;
+}
+
+.seoryco-wpmd-types {
+	color: #646970;
+	margin: 12px 0 0;
+}
+
+.seoryco-wpmd-paths {
+	margin-top: 12px;
+}
+
+.seoryco-wpmd-paths ul {
+	font-family: Consolas, Monaco, monospace;
+	font-size: 12px;
+	margin: 8px 0 0;
+	max-height: 260px;
+	overflow-y: auto;
+}
+
+.seoryco-wpmd-note p {
+	color: #646970;
+	margin: 0;
+}
