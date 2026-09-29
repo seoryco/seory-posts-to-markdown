@@ -16,6 +16,16 @@
  * - 6.9 does not catch exceptions thrown by callbacks, so execute callbacks
  *   catch them and return a WP_Error.
  *
+ * Access control (see docs/spec-v0.2-abilities.md §4.5):
+ * - A request-level gate (`read` for published-only requests, `edit_others_posts`
+ *   otherwise, filterable with `seoryco_wpmd_ability_permission`).
+ * - Only publicly viewable post types (is_post_type_viewable()) are served.
+ * - Per post type, each status is only queried when the user holds that post
+ *   type's own capability (cap->read, cap->read_private_posts, or
+ *   cap->edit_others_posts).
+ * - Per post, `read_post` (public and private statuses) or `edit_post` (all
+ *   other statuses) is checked before anything about the post is returned.
+ *
  * @package WP_to_Markdown
  */
 
@@ -67,34 +77,6 @@ function seoryco_wpmd_ability_meta() {
 }
 
 /**
- * JSON Schema for a paginated list output.
- *
- * @param array  $item_properties Properties of one item.
- * @param array  $item_required   Required item properties.
- * @param string $total_key       Name of the total-count property.
- * @return array
- */
-function seoryco_wpmd_list_output_schema( array $item_properties, array $item_required, $total_key = 'total' ) {
-	return array(
-		'type'       => 'object',
-		'properties' => array(
-			'items'       => array(
-				'type'  => 'array',
-				'items' => array(
-					'type'       => 'object',
-					'properties' => $item_properties,
-					'required'   => $item_required,
-				),
-			),
-			'page'        => array( 'type' => 'integer' ),
-			'per_page'    => array( 'type' => 'integer' ),
-			$total_key    => array( 'type' => 'integer' ),
-			'total_pages' => array( 'type' => 'integer' ),
-		),
-	);
-}
-
-/**
  * Register the abilities.
  */
 function seoryco_wpmd_register_abilities() {
@@ -107,19 +89,30 @@ function seoryco_wpmd_register_abilities() {
 			'enum' => $statuses,
 		),
 		'default'     => array( 'publish' ),
-		'description' => __( 'Post statuses to include. Anything other than publish requires the edit_others_posts capability.', 'seory-posts-to-markdown' ),
+		'description' => __( 'Post statuses to include. Anything other than publish requires the edit_others_posts capability. Results are further limited to posts the user can read or edit.', 'seory-posts-to-markdown' ),
 	);
 
 	$post_types_property = array(
 		'type'        => 'array',
 		'items'       => array( 'type' => 'string' ),
-		'description' => __( 'Post type slugs. Omit for all public post types.', 'seory-posts-to-markdown' ),
+		'description' => __( 'Post type slugs. Omit for all publicly viewable post types.', 'seory-posts-to-markdown' ),
 	);
 
 	$modified_after_property = array(
 		'type'        => 'string',
 		'format'      => 'date-time',
 		'description' => __( 'Datetime in GMT, e.g. 2026-09-01T00:00:00Z (a MySQL-style "YYYY-MM-DD HH:MM:SS" is also accepted). Only posts with post_modified_gmt greater than this value are returned.', 'seory-posts-to-markdown' ),
+	);
+
+	$cursor_property = array(
+		'type'        => 'string',
+		'pattern'     => '^[0-9]{14}-[0-9]{1,20}$',
+		'description' => __( 'Opaque cursor: pass the next_cursor value returned by the previous call to get the next page. Omit it for the first page, and keep the other input values the same on every page.', 'seory-posts-to-markdown' ),
+	);
+
+	$next_cursor_property = array(
+		'type'        => array( 'string', 'null' ),
+		'description' => __( 'Cursor for the next page, or null when there are no more posts. A page can hold fewer items than per_page even when more follow.', 'seory-posts-to-markdown' ),
 	);
 
 	$post_item_properties = array(
@@ -149,11 +142,7 @@ function seoryco_wpmd_register_abilities() {
 					'modified_after' => $modified_after_property,
 					'post_types'     => $post_types_property,
 					'status'         => $status_property,
-					'page'           => array(
-						'type'    => 'integer',
-						'minimum' => 1,
-						'default' => 1,
-					),
+					'cursor'         => $cursor_property,
 					'per_page'       => array(
 						'type'    => 'integer',
 						'minimum' => 1,
@@ -162,7 +151,21 @@ function seoryco_wpmd_register_abilities() {
 					),
 				),
 			),
-			'output_schema'       => seoryco_wpmd_list_output_schema( $post_item_properties, array( 'id', 'type', 'status', 'modified_gmt' ) ),
+			'output_schema'       => array(
+				'type'       => 'object',
+				'properties' => array(
+					'items'       => array(
+						'type'  => 'array',
+						'items' => array(
+							'type'       => 'object',
+							'properties' => $post_item_properties,
+							'required'   => array( 'id', 'type', 'status', 'modified_gmt' ),
+						),
+					),
+					'per_page'    => array( 'type' => 'integer' ),
+					'next_cursor' => $next_cursor_property,
+				),
+			),
 			'execute_callback'    => 'seoryco_wpmd_ability_list_posts',
 			'permission_callback' => 'seoryco_wpmd_ability_permission_list_posts',
 			'meta'                => seoryco_wpmd_ability_meta(),
@@ -173,7 +176,7 @@ function seoryco_wpmd_register_abilities() {
 		'seoryco-wpmd/list-post-ids',
 		array(
 			'label'               => __( 'List all post IDs with status and modified time', 'seory-posts-to-markdown' ),
-			'description'         => __( 'Lightweight full listing of ID, status, and post_modified_gmt for every post of the given types, including trashed items. Intended for detecting deletions, trashing, and unpublishing by diffing against a previously saved list — not for content sync (use list-posts for that).', 'seory-posts-to-markdown' ),
+			'description'         => __( 'Lightweight listing of ID, status, and post_modified_gmt for every post of the given types that the current user can read or edit, including trashed items, in ascending ID order. Intended for detecting deletions, trashing, and unpublishing by diffing against a previously saved list — not for content sync (use list-posts for that).', 'seory-posts-to-markdown' ),
 			'category'            => SEORYCO_WPMD_ABILITY_CATEGORY,
 			'input_schema'        => array(
 				'type'                 => 'object',
@@ -185,10 +188,11 @@ function seoryco_wpmd_register_abilities() {
 						'type'    => 'boolean',
 						'default' => true,
 					),
-					'page'          => array(
-						'type'    => 'integer',
-						'minimum' => 1,
-						'default' => 1,
+					'after_id'      => array(
+						'type'        => 'integer',
+						'minimum'     => 0,
+						'default'     => 0,
+						'description' => __( 'Return posts with an ID greater than this value. Omit it (or pass 0) for the first page, then pass next_after_id from the previous call.', 'seory-posts-to-markdown' ),
 					),
 					'per_page'      => array(
 						'type'    => 'integer',
@@ -198,14 +202,28 @@ function seoryco_wpmd_register_abilities() {
 					),
 				),
 			),
-			'output_schema'       => seoryco_wpmd_list_output_schema(
-				array(
-					'id'           => array( 'type' => 'integer' ),
-					'type'         => array( 'type' => 'string' ),
-					'status'       => array( 'type' => 'string' ),
-					'modified_gmt' => array( 'type' => 'string' ),
+			'output_schema'       => array(
+				'type'       => 'object',
+				'properties' => array(
+					'items'         => array(
+						'type'  => 'array',
+						'items' => array(
+							'type'       => 'object',
+							'properties' => array(
+								'id'           => array( 'type' => 'integer' ),
+								'type'         => array( 'type' => 'string' ),
+								'status'       => array( 'type' => 'string' ),
+								'modified_gmt' => array( 'type' => 'string' ),
+							),
+							'required'   => array( 'id', 'type', 'status', 'modified_gmt' ),
+						),
+					),
+					'per_page'      => array( 'type' => 'integer' ),
+					'next_after_id' => array(
+						'type'        => array( 'integer', 'null' ),
+						'description' => __( 'Value to pass as after_id for the next page, or null when there are no more posts.', 'seory-posts-to-markdown' ),
+					),
 				),
-				array( 'id', 'type', 'status', 'modified_gmt' )
 			),
 			'execute_callback'    => 'seoryco_wpmd_ability_list_post_ids',
 			'permission_callback' => 'seoryco_wpmd_ability_permission_list_post_ids',
@@ -267,11 +285,7 @@ function seoryco_wpmd_register_abilities() {
 					'modified_after' => $modified_after_property,
 					'post_types'     => $post_types_property,
 					'status'         => $status_property,
-					'page'           => array(
-						'type'    => 'integer',
-						'minimum' => 1,
-						'default' => 1,
-					),
+					'cursor'         => $cursor_property,
 					'per_page'       => array(
 						'type'        => 'integer',
 						'minimum'     => 1,
@@ -313,10 +327,8 @@ function seoryco_wpmd_register_abilities() {
 							'required'   => array( 'url', 'source_post_id' ),
 						),
 					),
-					'page'        => array( 'type' => 'integer' ),
 					'per_page'    => array( 'type' => 'integer' ),
-					'total_posts' => array( 'type' => 'integer' ),
-					'total_pages' => array( 'type' => 'integer' ),
+					'next_cursor' => $next_cursor_property,
 					'truncated'   => array(
 						'type'        => 'boolean',
 						'description' => __( 'true if any post\'s link count was cut off by the per-post link cap.', 'seory-posts-to-markdown' ),
@@ -374,27 +386,50 @@ function seoryco_wpmd_ability_normalize_list_input( $input, $max_page, $per_page
 		$modified_after = trim( (string) $input['modified_after'] );
 	}
 
-	$page = isset( $input['page'] ) && is_scalar( $input['page'] ) ? (int) $input['page'] : 1;
-	$size = isset( $input['per_page'] ) && is_scalar( $input['per_page'] ) ? (int) $input['per_page'] : $per_page;
+	$cursor = '';
+	if ( isset( $input['cursor'] ) && is_scalar( $input['cursor'] ) ) {
+		$cursor = trim( (string) $input['cursor'] );
+	}
+
+	$after_id = isset( $input['after_id'] ) && is_scalar( $input['after_id'] ) ? (int) $input['after_id'] : 0;
+	$size     = isset( $input['per_page'] ) && is_scalar( $input['per_page'] ) ? (int) $input['per_page'] : $per_page;
 
 	return array(
 		'modified_after' => $modified_after,
 		'post_types'     => $post_types,
 		'status'         => $statuses,
 		'include_trash'  => isset( $input['include_trash'] ) ? wp_validate_boolean( $input['include_trash'] ) : true,
-		'page'           => max( 1, $page ),
+		'cursor'         => $cursor,
+		'after_id'       => max( 0, $after_id ),
 		'per_page'       => min( $max_page, max( 1, $size ) ),
 	);
 }
 
 /**
- * Resolve requested post types against the public post types.
+ * Post types the abilities may serve: the exportable post types that are also
+ * publicly viewable (is_post_type_viewable(), which honors publicly_queryable).
+ *
+ * @return string[]
+ */
+function seoryco_wpmd_ability_post_types() {
+	$types = array();
+	foreach ( seoryco_wpmd_get_post_types() as $name => $object ) {
+		if ( is_post_type_viewable( $object ) ) {
+			$types[] = $name;
+		}
+	}
+
+	return $types;
+}
+
+/**
+ * Resolve requested post types against the post types the abilities may serve.
  *
  * @param string[] $requested Requested slugs (empty for all).
  * @return string[]|WP_Error
  */
 function seoryco_wpmd_ability_resolve_post_types( array $requested ) {
-	$allowed = array_keys( seoryco_wpmd_get_post_types() );
+	$allowed = seoryco_wpmd_ability_post_types();
 
 	if ( empty( $requested ) ) {
 		return $allowed;
@@ -440,26 +475,123 @@ function seoryco_wpmd_ability_parse_modified_after( $value ) {
 }
 
 /**
- * The post's modified time in GMT as ISO 8601 with a Z suffix.
+ * Parse a list cursor ("YYYYMMDDHHMMSS-ID").
  *
- * Posts inserted directly as drafts can have a zero post_modified_gmt; the
- * local post_modified is converted instead in that case.
+ * @param string $value Input value ('' when not given).
+ * @return array|null|WP_Error { modified: 'Y-m-d H:i:s', id: int }, or null when not given.
+ */
+function seoryco_wpmd_ability_parse_cursor( $value ) {
+	if ( '' === $value ) {
+		return null;
+	}
+
+	if ( ! preg_match( '/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})-(\d{1,20})$/', $value, $m ) ) {
+		return new WP_Error(
+			'seoryco_wpmd_invalid_cursor',
+			__( 'cursor is not valid. Pass the next_cursor value returned by the previous call.', 'seory-posts-to-markdown' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	return array(
+		'modified' => sprintf( '%s-%s-%s %s:%s:%s', $m[1], $m[2], $m[3], $m[4], $m[5], $m[6] ),
+		'id'       => (int) $m[7],
+	);
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * Modified time
+ * -------------------------------------------------------------------------
+ */
+
+/**
+ * The site's current UTC offset in seconds.
+ *
+ * Used to derive a GMT time for posts whose post_modified_gmt is zero. The same
+ * value is used in SQL and in PHP so that ordering, filtering, cursors, and the
+ * returned modified_gmt all agree within a request.
+ *
+ * @return int
+ */
+function seoryco_wpmd_ability_gmt_offset() {
+	return (int) round( (float) get_option( 'gmt_offset' ) * HOUR_IN_SECONDS );
+}
+
+/**
+ * The effective modified time of a post in GMT ("Y-m-d H:i:s").
+ *
+ * post_modified_gmt, or, when it is zero (posts inserted directly as drafts),
+ * post_modified shifted by the site's current UTC offset. Mirrors
+ * seoryco_wpmd_ability_modified_sql() exactly.
+ *
+ * @param WP_Post $post Post.
+ * @return string '0000-00-00 00:00:00' when no usable date exists.
+ */
+function seoryco_wpmd_ability_effective_modified( $post ) {
+	$zero = '0000-00-00 00:00:00';
+	$gmt  = (string) $post->post_modified_gmt;
+	if ( '' !== $gmt && $zero !== $gmt ) {
+		return $gmt;
+	}
+
+	$local = (string) $post->post_modified;
+	if ( '' === $local || $zero === $local ) {
+		return $zero;
+	}
+
+	$timestamp = strtotime( $local . ' UTC' );
+	if ( false === $timestamp ) {
+		return $zero;
+	}
+
+	return gmdate( 'Y-m-d H:i:s', $timestamp - seoryco_wpmd_ability_gmt_offset() );
+}
+
+/**
+ * SQL expression for the effective modified time (see seoryco_wpmd_ability_effective_modified()).
+ *
+ * @return string
+ */
+function seoryco_wpmd_ability_modified_sql() {
+	global $wpdb;
+
+	return $wpdb->prepare(
+		"IF( {$wpdb->posts}.post_modified_gmt = '0000-00-00 00:00:00' AND {$wpdb->posts}.post_modified <> '0000-00-00 00:00:00', DATE_SUB( {$wpdb->posts}.post_modified, INTERVAL %d SECOND ), {$wpdb->posts}.post_modified_gmt )",
+		seoryco_wpmd_ability_gmt_offset()
+	);
+}
+
+/**
+ * The post's modified time in GMT as ISO 8601 with a Z suffix.
  *
  * @param WP_Post $post Post.
  * @return string '' when no usable date exists.
  */
 function seoryco_wpmd_ability_modified_gmt( $post ) {
-	$gmt = (string) $post->post_modified_gmt;
-	if ( '' === $gmt || 0 === strpos( $gmt, '0000-00-00' ) ) {
-		$local = (string) $post->post_modified;
-		if ( '' === $local || 0 === strpos( $local, '0000-00-00' ) ) {
-			return '';
-		}
-		$gmt = get_gmt_from_date( $local );
+	$modified = seoryco_wpmd_ability_effective_modified( $post );
+	if ( 0 === strpos( $modified, '0000-00-00' ) ) {
+		return '';
 	}
 
-	return (string) mysql2date( 'Y-m-d\TH:i:s\Z', $gmt, false );
+	return str_replace( ' ', 'T', $modified ) . 'Z';
 }
+
+/**
+ * Cursor pointing just after the given post in (effective modified, ID) order.
+ *
+ * @param WP_Post $post Post.
+ * @return string
+ */
+function seoryco_wpmd_ability_make_cursor( $post ) {
+	return str_replace( array( '-', ' ', ':' ), '', seoryco_wpmd_ability_effective_modified( $post ) ) . '-' . (int) $post->ID;
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * Helpers
+ * -------------------------------------------------------------------------
+ */
 
 /**
  * Plain-text post title without the "Protected:" / "Private:" prefixes.
@@ -513,7 +645,12 @@ function seoryco_wpmd_ability_exception_error( $e ) {
  */
 
 /**
- * Check a capability after letting the site override it.
+ * Check the request-level capability after letting the site override it.
+ *
+ * This is only the first gate. Post type and per-post checks
+ * (seoryco_wpmd_ability_allowed_statuses(), seoryco_wpmd_ability_can_access_post())
+ * always apply on top of it, so the filter cannot expose posts the user could
+ * not otherwise read or edit.
  *
  * @param string $capability   Capability required by default.
  * @param string $ability_name Ability name.
@@ -525,7 +662,10 @@ function seoryco_wpmd_ability_check_capability( $capability, $ability_name, arra
 	 * Filters the capability required to run one of this plugin's abilities.
 	 *
 	 * Return a capability name to require a different capability, or a boolean
-	 * to allow or deny the call outright.
+	 * to allow or deny the call outright. This controls the request-level gate
+	 * only: results are always limited to publicly viewable post types and to
+	 * posts the user can read (`read_post`) or edit (`edit_post`), using each
+	 * post type's own capabilities.
 	 *
 	 * @since 0.2
 	 *
@@ -548,7 +688,7 @@ function seoryco_wpmd_ability_check_capability( $capability, $ability_name, arra
 }
 
 /**
- * Permission callback for list-posts and list-external-links.
+ * Permission callback for list-posts.
  *
  * @param mixed $input Ability input.
  * @return bool
@@ -572,7 +712,7 @@ function seoryco_wpmd_ability_permission_list_external_links( $input = null ) {
 }
 
 /**
- * Capability needed for a set of statuses: `read` for published only, else `edit_others_posts`.
+ * Request-level capability for a set of statuses: `read` for published only, else `edit_others_posts`.
  *
  * @param string[] $statuses Normalized statuses.
  * @return string
@@ -582,7 +722,7 @@ function seoryco_wpmd_ability_status_capability( array $statuses ) {
 }
 
 /**
- * Permission callback for list-post-ids (trash and private items are always exposed).
+ * Permission callback for list-post-ids (trash and private items are listed).
  *
  * @param mixed $input Ability input.
  * @return bool
@@ -591,6 +731,93 @@ function seoryco_wpmd_ability_permission_list_post_ids( $input = null ) {
 	$args = seoryco_wpmd_ability_normalize_list_input( $input, 500, 500 );
 
 	return seoryco_wpmd_ability_check_capability( 'edit_others_posts', 'seoryco-wpmd/list-post-ids', $args );
+}
+
+/**
+ * The statuses of one post type that the current user may see, using the post
+ * type's own capabilities:
+ * - public statuses (publish): cap->read
+ * - private statuses: cap->read_private_posts
+ * - everything else (draft, pending, future, trash, custom): cap->edit_others_posts
+ *
+ * @param string   $post_type Post type slug.
+ * @param string[] $statuses  Candidate statuses.
+ * @return string[]
+ */
+function seoryco_wpmd_ability_allowed_statuses( $post_type, array $statuses ) {
+	$object = get_post_type_object( $post_type );
+	if ( ! $object instanceof WP_Post_Type ) {
+		return array();
+	}
+
+	$allowed = array();
+	foreach ( $statuses as $status ) {
+		$status_object = get_post_status_object( $status );
+		if ( ! $status_object ) {
+			continue;
+		}
+
+		if ( $status_object->public ) {
+			$capability = $object->cap->read;
+		} elseif ( $status_object->private ) {
+			$capability = $object->cap->read_private_posts;
+		} else {
+			$capability = $object->cap->edit_others_posts;
+		}
+
+		if ( is_string( $capability ) && '' !== $capability && current_user_can( $capability ) ) {
+			$allowed[] = $status;
+		}
+	}
+
+	return $allowed;
+}
+
+/**
+ * Map each post type to the statuses the current user may see (types with none are dropped).
+ *
+ * @param string[] $post_types Post type slugs.
+ * @param string[] $statuses   Candidate statuses.
+ * @return array<string, string[]>
+ */
+function seoryco_wpmd_ability_type_statuses( array $post_types, array $statuses ) {
+	$map = array();
+	foreach ( $post_types as $post_type ) {
+		$allowed = seoryco_wpmd_ability_allowed_statuses( $post_type, $statuses );
+		if ( ! empty( $allowed ) ) {
+			$map[ $post_type ] = $allowed;
+		}
+	}
+
+	return $map;
+}
+
+/**
+ * Whether the current user may receive data about this post.
+ *
+ * The post type must be served by the abilities (publicly viewable), the status
+ * must be allowed by the post type's capabilities, and the user must pass the
+ * per-post meta capability: `read_post` for public and private statuses,
+ * `edit_post` for everything else (drafts, pending, scheduled, trashed).
+ *
+ * @param WP_Post $post Post.
+ * @return bool
+ */
+function seoryco_wpmd_ability_can_access_post( $post ) {
+	if ( ! $post instanceof WP_Post || ! in_array( $post->post_type, seoryco_wpmd_ability_post_types(), true ) ) {
+		return false;
+	}
+
+	if ( array( $post->post_status ) !== seoryco_wpmd_ability_allowed_statuses( $post->post_type, array( $post->post_status ) ) ) {
+		return false;
+	}
+
+	$status_object = get_post_status_object( $post->post_status );
+	if ( $status_object && ( $status_object->public || $status_object->private ) ) {
+		return current_user_can( 'read_post', $post->ID );
+	}
+
+	return current_user_can( 'edit_post', $post->ID );
 }
 
 /**
@@ -605,20 +832,15 @@ function seoryco_wpmd_ability_permission_get_post_markdown( $input = null ) {
 	$args = seoryco_wpmd_ability_normalize_post_input( $input );
 	$post = $args['id'] > 0 ? get_post( $args['id'] ) : null;
 
-	if ( ! $post instanceof WP_Post || ! array_key_exists( $post->post_type, seoryco_wpmd_get_post_types() ) ) {
+	if ( ! $post instanceof WP_Post || post_password_required( $post ) ) {
 		return false;
 	}
 
-	if ( post_password_required( $post ) ) {
+	if ( ! seoryco_wpmd_ability_check_capability( seoryco_wpmd_ability_status_capability( array( $post->post_status ) ), 'seoryco-wpmd/get-post-markdown', $args ) ) {
 		return false;
 	}
 
-	if ( 'publish' === $post->post_status ) {
-		return seoryco_wpmd_ability_check_capability( 'read', 'seoryco-wpmd/get-post-markdown', $args );
-	}
-
-	return seoryco_wpmd_ability_check_capability( 'edit_others_posts', 'seoryco-wpmd/get-post-markdown', $args )
-		&& current_user_can( 'read_post', $post->ID );
+	return seoryco_wpmd_ability_can_access_post( $post );
 }
 
 /**
@@ -644,30 +866,114 @@ function seoryco_wpmd_ability_normalize_post_input( $input ) {
  */
 
 /**
- * Order the plugin's ability queries by post_modified_gmt (then ID).
+ * Add this plugin's post type/status matrix, filters, cursor, and ordering to
+ * its own queries (marked with the `seoryco_wpmd_spec` query variable).
  *
- * @param string   $orderby ORDER BY clause.
+ * @param array    $clauses Query clauses.
  * @param WP_Query $query   Query.
- * @return string
+ * @return array
  */
-function seoryco_wpmd_ability_orderby_gmt( $orderby, $query ) {
-	if ( $query instanceof WP_Query && $query->get( 'seoryco_wpmd_order_gmt' ) ) {
-		global $wpdb;
-
-		return "{$wpdb->posts}.post_modified_gmt ASC, {$wpdb->posts}.ID ASC";
+function seoryco_wpmd_ability_posts_clauses( $clauses, $query ) {
+	if ( ! $query instanceof WP_Query ) {
+		return $clauses;
 	}
 
-	return $orderby;
+	$spec = $query->get( 'seoryco_wpmd_spec' );
+	if ( ! is_array( $spec ) || empty( $spec['type_statuses'] ) ) {
+		return $clauses;
+	}
+
+	global $wpdb;
+
+	// Each post type only with the statuses the user may see for that type.
+	$pairs = array();
+	foreach ( $spec['type_statuses'] as $post_type => $statuses ) {
+		$placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Table name from $wpdb; placeholders are built to match the values.
+		$pairs[] = $wpdb->prepare( "( {$wpdb->posts}.post_type = %s AND {$wpdb->posts}.post_status IN ( {$placeholders} ) )", array_merge( array( $post_type ), array_values( $statuses ) ) );
+	}
+	$where = ' AND ( ' . implode( ' OR ', $pairs ) . ' )';
+
+	if ( 'id' === $spec['order'] ) {
+		if ( $spec['after_id'] > 0 ) {
+			$where .= $wpdb->prepare( " AND {$wpdb->posts}.ID > %d", $spec['after_id'] );
+		}
+		$clauses['orderby'] = "{$wpdb->posts}.ID ASC";
+	} else {
+		$modified = seoryco_wpmd_ability_modified_sql();
+
+		if ( '' !== $spec['modified_after'] ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $modified is built with $wpdb->prepare().
+			$where .= $wpdb->prepare( " AND {$modified} > %s", $spec['modified_after'] );
+		}
+
+		if ( is_array( $spec['cursor'] ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $modified is built with $wpdb->prepare().
+			$where .= $wpdb->prepare( " AND ( {$modified} > %s OR ( {$modified} = %s AND {$wpdb->posts}.ID > %d ) )", $spec['cursor']['modified'], $spec['cursor']['modified'], $spec['cursor']['id'] );
+		}
+
+		$clauses['orderby'] = "{$modified} ASC, {$wpdb->posts}.ID ASC";
+	}
+
+	$clauses['where'] .= $where;
+
+	return $clauses;
 }
-add_filter( 'posts_orderby', 'seoryco_wpmd_ability_orderby_gmt', 10, 2 );
+add_filter( 'posts_clauses', 'seoryco_wpmd_ability_posts_clauses', 10, 2 );
 
 /**
- * Run the paginated post query shared by list-posts and list-external-links.
+ * Fetch up to $limit + 1 posts (the extra row tells whether another page exists).
+ *
+ * @param array<string, string[]> $type_statuses Post type => allowed statuses.
+ * @param array                   $spec          order (modified|id), modified_after, cursor, after_id.
+ * @param int                     $limit         Page size.
+ * @return WP_Post[]
+ */
+function seoryco_wpmd_ability_fetch_posts( array $type_statuses, array $spec, $limit ) {
+	if ( empty( $type_statuses ) ) {
+		return array();
+	}
+
+	$statuses = array();
+	foreach ( $type_statuses as $allowed ) {
+		$statuses = array_merge( $statuses, $allowed );
+	}
+
+	$query = new WP_Query(
+		array(
+			'post_type'              => array_keys( $type_statuses ),
+			'post_status'            => array_values( array_unique( $statuses ) ),
+			'posts_per_page'         => $limit + 1,
+			'orderby'                => 'ID',
+			'order'                  => 'ASC',
+			'ignore_sticky_posts'    => true,
+			'no_found_rows'          => true,
+			'suppress_filters'       => false,
+			'update_post_meta_cache' => false,
+			'update_post_term_cache' => false,
+			'seoryco_wpmd_spec'      => array_merge(
+				array(
+					'order'          => 'modified',
+					'modified_after' => '',
+					'cursor'         => null,
+					'after_id'       => 0,
+				),
+				$spec,
+				array( 'type_statuses' => $type_statuses )
+			),
+		)
+	);
+
+	return is_array( $query->posts ) ? $query->posts : array();
+}
+
+/**
+ * Run the modified-order query shared by list-posts and list-external-links.
  *
  * @param array $args Normalized input.
- * @return WP_Query|WP_Error
+ * @return array|WP_Error { posts: WP_Post[] (at most per_page), has_more: bool }
  */
-function seoryco_wpmd_ability_query_posts( array $args ) {
+function seoryco_wpmd_ability_query_modified( array $args ) {
 	$post_types = seoryco_wpmd_ability_resolve_post_types( $args['post_types'] );
 	if ( is_wp_error( $post_types ) ) {
 		return $post_types;
@@ -678,30 +984,25 @@ function seoryco_wpmd_ability_query_posts( array $args ) {
 		return $modified_after;
 	}
 
-	$query_args = array(
-		'post_type'              => $post_types,
-		'post_status'            => $args['status'],
-		'posts_per_page'         => $args['per_page'],
-		'paged'                  => $args['page'],
-		'orderby'                => 'modified',
-		'order'                  => 'ASC',
-		'ignore_sticky_posts'    => true,
-		'suppress_filters'       => false,
-		'update_post_meta_cache' => false,
-		'seoryco_wpmd_order_gmt' => true,
-	);
-
-	if ( '' !== $modified_after ) {
-		$query_args['date_query'] = array(
-			array(
-				'column'    => 'post_modified_gmt',
-				'after'     => $modified_after,
-				'inclusive' => false,
-			),
-		);
+	$cursor = seoryco_wpmd_ability_parse_cursor( $args['cursor'] );
+	if ( is_wp_error( $cursor ) ) {
+		return $cursor;
 	}
 
-	return new WP_Query( $query_args );
+	$posts = seoryco_wpmd_ability_fetch_posts(
+		seoryco_wpmd_ability_type_statuses( $post_types, $args['status'] ),
+		array(
+			'order'          => 'modified',
+			'modified_after' => $modified_after,
+			'cursor'         => $cursor,
+		),
+		$args['per_page']
+	);
+
+	return array(
+		'posts'    => array_slice( $posts, 0, $args['per_page'] ),
+		'has_more' => count( $posts ) > $args['per_page'],
+	);
 }
 
 /*
@@ -718,14 +1019,18 @@ function seoryco_wpmd_ability_query_posts( array $args ) {
  */
 function seoryco_wpmd_ability_list_posts( $input = null ) {
 	try {
-		$args  = seoryco_wpmd_ability_normalize_list_input( $input, 100, 50 );
-		$query = seoryco_wpmd_ability_query_posts( $args );
-		if ( is_wp_error( $query ) ) {
-			return $query;
+		$args   = seoryco_wpmd_ability_normalize_list_input( $input, 100, 50 );
+		$result = seoryco_wpmd_ability_query_modified( $args );
+		if ( is_wp_error( $result ) ) {
+			return $result;
 		}
 
 		$items = array();
-		foreach ( $query->posts as $post ) {
+		foreach ( $result['posts'] as $post ) {
+			if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
+				continue;
+			}
+
 			$link    = get_permalink( $post );
 			$items[] = array(
 				'id'           => (int) $post->ID,
@@ -738,12 +1043,12 @@ function seoryco_wpmd_ability_list_posts( $input = null ) {
 			);
 		}
 
+		$last = end( $result['posts'] );
+
 		return array(
 			'items'       => $items,
-			'page'        => (int) $args['page'],
 			'per_page'    => (int) $args['per_page'],
-			'total'       => (int) $query->found_posts,
-			'total_pages' => (int) $query->max_num_pages,
+			'next_cursor' => ( $result['has_more'] && $last ) ? seoryco_wpmd_ability_make_cursor( $last ) : null,
 		);
 	} catch ( Throwable $e ) {
 		return seoryco_wpmd_ability_exception_error( $e );
@@ -770,23 +1075,23 @@ function seoryco_wpmd_ability_list_post_ids( $input = null ) {
 			$statuses[] = 'trash';
 		}
 
-		$query = new WP_Query(
+		$posts    = seoryco_wpmd_ability_fetch_posts(
+			seoryco_wpmd_ability_type_statuses( $post_types, $statuses ),
 			array(
-				'post_type'              => $post_types,
-				'post_status'            => $statuses,
-				'posts_per_page'         => $args['per_page'],
-				'paged'                  => $args['page'],
-				'orderby'                => 'ID',
-				'order'                  => 'ASC',
-				'ignore_sticky_posts'    => true,
-				'suppress_filters'       => false,
-				'update_post_meta_cache' => false,
-				'update_post_term_cache' => false,
-			)
+				'order'    => 'id',
+				'after_id' => $args['after_id'],
+			),
+			$args['per_page']
 		);
+		$has_more = count( $posts ) > $args['per_page'];
+		$posts    = array_slice( $posts, 0, $args['per_page'] );
 
 		$items = array();
-		foreach ( $query->posts as $post ) {
+		foreach ( $posts as $post ) {
+			if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
+				continue;
+			}
+
 			$items[] = array(
 				'id'           => (int) $post->ID,
 				'type'         => (string) $post->post_type,
@@ -795,12 +1100,12 @@ function seoryco_wpmd_ability_list_post_ids( $input = null ) {
 			);
 		}
 
+		$last = end( $posts );
+
 		return array(
-			'items'       => $items,
-			'page'        => (int) $args['page'],
-			'per_page'    => (int) $args['per_page'],
-			'total'       => (int) $query->found_posts,
-			'total_pages' => (int) $query->max_num_pages,
+			'items'         => $items,
+			'per_page'      => (int) $args['per_page'],
+			'next_after_id' => ( $has_more && $last ) ? (int) $last->ID : null,
 		);
 	} catch ( Throwable $e ) {
 		return seoryco_wpmd_ability_exception_error( $e );
@@ -815,7 +1120,17 @@ function seoryco_wpmd_ability_list_post_ids( $input = null ) {
  */
 function seoryco_wpmd_ability_get_post_markdown( $input = null ) {
 	try {
-		$args     = seoryco_wpmd_ability_normalize_post_input( $input );
+		$args = seoryco_wpmd_ability_normalize_post_input( $input );
+
+		// Re-check right before converting, in case the post changed after the permission check.
+		if ( ! seoryco_wpmd_ability_permission_get_post_markdown( $args ) ) {
+			return new WP_Error(
+				'seoryco_wpmd_not_found',
+				__( 'The post could not be found.', 'seory-posts-to-markdown' ),
+				array( 'status' => 404 )
+			);
+		}
+
 		$exporter = new Seoryco_Wpmd_Exporter( seoryco_wpmd_ability_exporter_options( $args['mode'] ) );
 		if ( ! $exporter->is_available() ) {
 			return new WP_Error(
@@ -878,10 +1193,10 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
 			);
 		}
 
-		$args  = seoryco_wpmd_ability_normalize_list_input( $input, 50, 20 );
-		$query = seoryco_wpmd_ability_query_posts( $args );
-		if ( is_wp_error( $query ) ) {
-			return $query;
+		$args   = seoryco_wpmd_ability_normalize_list_input( $input, 50, 20 );
+		$result = seoryco_wpmd_ability_query_modified( $args );
+		if ( is_wp_error( $result ) ) {
+			return $result;
 		}
 
 		$exporter  = new Seoryco_Wpmd_Exporter( seoryco_wpmd_ability_exporter_options( 'rendered' ) );
@@ -889,38 +1204,47 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
 		$items     = array();
 		$truncated = false;
 
-		foreach ( $query->posts as $post ) {
-			// Password-protected content is never exposed (same rule as get-post-markdown).
-			if ( post_password_required( $post ) ) {
-				continue;
-			}
+		// A GET that lists links must not fetch embeds or write the oEmbed cache.
+		$suspended = seoryco_wpmd_ability_suspend_oembed();
+		try {
+			foreach ( $result['posts'] as $post ) {
+				if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
+					continue;
+				}
 
-			$links = seoryco_wpmd_ability_extract_links( $exporter->get_content_html( $post ), $site_host );
-			if ( count( $links ) > SEORYCO_WPMD_LINKS_PER_POST ) {
-				$links     = array_slice( $links, 0, SEORYCO_WPMD_LINKS_PER_POST );
-				$truncated = true;
-			}
+				// Password-protected content is never exposed (same rule as get-post-markdown).
+				if ( post_password_required( $post ) ) {
+					continue;
+				}
 
-			$post_link = get_permalink( $post );
-			foreach ( $links as $link ) {
-				$items[] = array(
-					'url'              => $link['url'],
-					'source_post_id'   => (int) $post->ID,
-					'source_post_link' => $post_link ? (string) $post_link : '',
-					'anchor_text'      => $link['anchor_text'],
-					'rel'              => $link['rel'],
-					'target'           => $link['target'],
-					'context'          => $link['context'],
-				);
+				$found = seoryco_wpmd_ability_extract_links( $exporter->get_content_html( $post ), $site_host, SEORYCO_WPMD_LINKS_PER_POST );
+				if ( $found['truncated'] ) {
+					$truncated = true;
+				}
+
+				$post_link = get_permalink( $post );
+				foreach ( $found['links'] as $link ) {
+					$items[] = array(
+						'url'              => $link['url'],
+						'source_post_id'   => (int) $post->ID,
+						'source_post_link' => $post_link ? (string) $post_link : '',
+						'anchor_text'      => $link['anchor_text'],
+						'rel'              => $link['rel'],
+						'target'           => $link['target'],
+						'context'          => $link['context'],
+					);
+				}
 			}
+		} finally {
+			seoryco_wpmd_ability_restore_oembed( $suspended );
 		}
+
+		$last = end( $result['posts'] );
 
 		return array(
 			'items'       => $items,
-			'page'        => (int) $args['page'],
 			'per_page'    => (int) $args['per_page'],
-			'total_posts' => (int) $query->found_posts,
-			'total_pages' => (int) $query->max_num_pages,
+			'next_cursor' => ( $result['has_more'] && $last ) ? seoryco_wpmd_ability_make_cursor( $last ) : null,
 			'truncated'   => $truncated,
 		);
 	} catch ( Throwable $e ) {
@@ -930,20 +1254,142 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
 
 /*
  * -------------------------------------------------------------------------
+ * oEmbed suspension (list-external-links only)
+ * -------------------------------------------------------------------------
+ */
+
+/**
+ * Turn off oEmbed while list-external-links renders content.
+ *
+ * - Removes WP_Embed's `the_content` filters (run_shortcode, autoembed), which
+ *   are the normal path for embeds in post content.
+ * - Short-circuits any remaining oEmbed request (e.g. core blocks that call
+ *   WP_Embed::autoembed() or wp_oembed_get() directly), so no HTTP request is made.
+ * - Blocks writes of `_oembed_*` post meta, so the oEmbed cache is not changed.
+ *
+ * Always paired with seoryco_wpmd_ability_restore_oembed() in a finally block.
+ *
+ * @return array Removed WP_Embed filters as [ method, priority ] pairs.
+ */
+function seoryco_wpmd_ability_suspend_oembed() {
+	global $wp_embed;
+
+	$removed = array();
+	if ( $wp_embed instanceof WP_Embed ) {
+		foreach ( array( 'run_shortcode', 'autoembed' ) as $method ) {
+			$priority = has_filter( 'the_content', array( $wp_embed, $method ) );
+			if ( false !== $priority ) {
+				remove_filter( 'the_content', array( $wp_embed, $method ), $priority );
+				$removed[] = array( $method, $priority );
+			}
+		}
+	}
+
+	add_filter( 'pre_oembed_result', 'seoryco_wpmd_ability_block_oembed', PHP_INT_MAX );
+	add_filter( 'update_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX, 3 );
+	add_filter( 'add_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX, 3 );
+
+	return $removed;
+}
+
+/**
+ * Undo seoryco_wpmd_ability_suspend_oembed().
+ *
+ * @param array $removed Value returned by seoryco_wpmd_ability_suspend_oembed().
+ */
+function seoryco_wpmd_ability_restore_oembed( array $removed ) {
+	global $wp_embed;
+
+	remove_filter( 'pre_oembed_result', 'seoryco_wpmd_ability_block_oembed', PHP_INT_MAX );
+	remove_filter( 'update_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
+	remove_filter( 'add_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
+
+	if ( $wp_embed instanceof WP_Embed ) {
+		foreach ( $removed as $filter ) {
+			add_filter( 'the_content', array( $wp_embed, $filter[0] ), $filter[1] );
+		}
+	}
+}
+
+/**
+ * Short-circuit remote oEmbed lookups (local results already produced by core are kept).
+ *
+ * @param string|false|null $result oEmbed HTML, or null to continue.
+ * @return string|false
+ */
+function seoryco_wpmd_ability_block_oembed( $result ) {
+	return null === $result ? false : $result;
+}
+
+/**
+ * Skip writes of oEmbed cache post meta.
+ *
+ * @param null|bool $check    Short-circuit value.
+ * @param int       $post_id  Post ID.
+ * @param string    $meta_key Meta key.
+ * @return null|bool
+ */
+function seoryco_wpmd_ability_block_oembed_cache( $check, $post_id, $meta_key ) {
+	if ( is_string( $meta_key ) && 0 === strpos( $meta_key, '_oembed_' ) ) {
+		return false;
+	}
+
+	return $check;
+}
+
+/*
+ * -------------------------------------------------------------------------
  * Link extraction
  * -------------------------------------------------------------------------
  */
 
 /**
- * Lowercase a host and drop a leading "www." so www/non-www count as the same site.
+ * Normalize a host for same-site comparison.
+ *
+ * Percent-decodes and lowercases the host, converts internationalized names to
+ * their ASCII (punycode) form, and drops a leading "www." so www/non-www and
+ * Unicode/ASCII spellings of the same host compare equal.
  *
  * @param string $host Host.
  * @return string
  */
 function seoryco_wpmd_ability_normalize_host( $host ) {
-	$host = strtolower( trim( $host, " \t\n\r\0\x0B." ) );
+	$host = trim( rawurldecode( (string) $host ), " \t\n\r\0\x0B." );
+	$host = function_exists( 'mb_strtolower' ) ? mb_strtolower( $host, 'UTF-8' ) : strtolower( $host );
+
+	if ( preg_match( '/[^\x21-\x7e]/', $host ) ) {
+		$host = seoryco_wpmd_ability_idn_to_ascii( $host );
+	}
 
 	return 0 === strpos( $host, 'www.' ) ? substr( $host, 4 ) : $host;
+}
+
+/**
+ * Convert an internationalized host name to ASCII.
+ *
+ * Uses the intl extension when available, otherwise the IDNA encoder bundled
+ * with WordPress (Requests). Returns the input unchanged if neither can encode it.
+ *
+ * @param string $host Lowercased host.
+ * @return string
+ */
+function seoryco_wpmd_ability_idn_to_ascii( $host ) {
+	if ( function_exists( 'idn_to_ascii' ) && defined( 'INTL_IDNA_VARIANT_UTS46' ) ) {
+		$ascii = idn_to_ascii( $host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46 );
+		if ( is_string( $ascii ) && '' !== $ascii ) {
+			return strtolower( $ascii );
+		}
+	}
+
+	if ( class_exists( '\WpOrg\Requests\IdnaEncoder' ) ) {
+		try {
+			return strtolower( \WpOrg\Requests\IdnaEncoder::encode( $host ) );
+		} catch ( Exception $e ) {
+			return $host;
+		}
+	}
+
+	return $host;
 }
 
 /**
@@ -961,14 +1407,23 @@ function seoryco_wpmd_ability_clean_text( $text ) {
 /**
  * Extract external links (http/https to another host) from rendered HTML.
  *
+ * Stops as soon as one more external link than $limit is found, so link-heavy
+ * pages do not build context strings for links that would be discarded.
+ *
  * @param string $html      Rendered post HTML.
  * @param string $site_host Normalized host of the site.
- * @return array[] Each: url, anchor_text, rel, target, context.
+ * @param int    $limit     Maximum number of links to return.
+ * @return array { links: array[] (each: url, anchor_text, rel, target, context), truncated: bool }
  */
-function seoryco_wpmd_ability_extract_links( $html, $site_host ) {
+function seoryco_wpmd_ability_extract_links( $html, $site_host, $limit ) {
+	$result = array(
+		'links'     => array(),
+		'truncated' => false,
+	);
+
 	$html = (string) $html;
 	if ( '' === trim( $html ) || false === stripos( $html, '<a' ) ) {
-		return array();
+		return $result;
 	}
 
 	$previous = libxml_use_internal_errors( true );
@@ -978,11 +1433,10 @@ function seoryco_wpmd_ability_extract_links( $html, $site_host ) {
 	libxml_use_internal_errors( $previous );
 
 	if ( ! $loaded ) {
-		return array();
+		return $result;
 	}
 
 	$scheme = (string) wp_parse_url( home_url(), PHP_URL_SCHEME );
-	$links  = array();
 
 	foreach ( $document->getElementsByTagName( 'a' ) as $anchor ) {
 		$href = trim( (string) $anchor->getAttribute( 'href' ) );
@@ -1005,7 +1459,12 @@ function seoryco_wpmd_ability_extract_links( $html, $site_host ) {
 		}
 
 		if ( seoryco_wpmd_ability_normalize_host( $parts['host'] ) === $site_host ) {
-			continue; // Internal link (any port / www variant).
+			continue; // Internal link (any port / www / IDN spelling).
+		}
+
+		if ( count( $result['links'] ) >= $limit ) {
+			$result['truncated'] = true;
+			break;
 		}
 
 		$anchor_text = seoryco_wpmd_ability_clean_text( $anchor->textContent ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
@@ -1018,7 +1477,7 @@ function seoryco_wpmd_ability_extract_links( $html, $site_host ) {
 
 		$rel = preg_split( '/\s+/', strtolower( trim( (string) $anchor->getAttribute( 'rel' ) ) ), -1, PREG_SPLIT_NO_EMPTY );
 
-		$links[] = array(
+		$result['links'][] = array(
 			'url'         => $href,
 			'anchor_text' => $anchor_text,
 			'rel'         => array_values( array_unique( is_array( $rel ) ? $rel : array() ) ),
@@ -1027,7 +1486,7 @@ function seoryco_wpmd_ability_extract_links( $html, $site_host ) {
 		);
 	}
 
-	return $links;
+	return $result;
 }
 
 /**
