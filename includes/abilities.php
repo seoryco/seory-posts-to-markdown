@@ -1748,26 +1748,43 @@ function seoryco_wpmd_ability_link_context( $anchor, $anchor_text = '' ) {
 		return '';
 	}
 
-	// Private-use characters mark where the link starts and ends.
-	$open    = "\u{E000}";
-	$close   = "\u{E001}";
-	$markers = array( $open, $close );
-	$inside  = str_replace( $markers, '', (string) $anchor->textContent ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
-	$before  = str_replace( $markers, '', seoryco_wpmd_ability_context_side( $anchor, $block, true ) );
-	$after   = str_replace( $markers, '', seoryco_wpmd_ability_context_side( $anchor, $block, false ) );
-
-	$text = seoryco_wpmd_ability_clean_text( $before . $open . $inside . $close . $after );
-	if ( '' === trim( str_replace( $markers, '', $text ) ) ) {
+	// The text before, inside, and after the link, joined with collapsed
+	// whitespace. The link's position is kept as byte offsets ($from, $to), not
+	// as marker characters, so no character of the post text is lost.
+	$inside   = (string) $anchor->textContent; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+	$segments = array(
+		seoryco_wpmd_ability_context_side( $anchor, $block, true ),
+		$inside,
+		seoryco_wpmd_ability_context_side( $anchor, $block, false ),
+	);
+	$text     = '';
+	$from     = 0;
+	$to       = 0;
+	foreach ( $segments as $index => $segment ) {
+		$segment = (string) preg_replace( '/[\s\x{00A0}\x{3000}]+/u', ' ', (string) $segment );
+		if ( ( '' === $text || ' ' === substr( $text, -1 ) ) && ' ' === substr( $segment, 0, 1 ) ) {
+			$segment = substr( $segment, 1 );
+		}
+		if ( 1 === $index ) {
+			$from = strlen( $text );
+		}
+		$text .= $segment;
+		if ( 1 === $index ) {
+			$to = strlen( $text );
+		}
+	}
+	$text = rtrim( $text, ' ' );
+	$to   = min( $to, strlen( $text ) );
+	$from = min( $from, $to );
+	if ( '' === $text ) {
 		return '';
 	}
 
 	// Pick the sentence(s) that contain the link.
+	$start = 0;
 	$parts = preg_split( '/(?<=[。！？!?])\s*|(?<=\.)\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY | PREG_SPLIT_OFFSET_CAPTURE );
-	$from  = strpos( $text, $open );
-	$to    = strpos( $text, $close ) + strlen( $close );
 	if ( is_array( $parts ) && ! empty( $parts ) ) {
-		$start = 0;
-		$end   = strlen( $text );
+		$end = strlen( $text );
 		foreach ( $parts as $part ) {
 			if ( $part[1] <= $from ) {
 				$start = $part[1];
@@ -1776,22 +1793,22 @@ function seoryco_wpmd_ability_link_context( $anchor, $anchor_text = '' ) {
 				$end = $part[1] + strlen( $part[0] );
 			}
 		}
-		$text = trim( substr( $text, $start, $end - $start ) );
+		$end  = max( $end, $to );
+		$text = substr( $text, $start, $end - $start );
 	}
 
-	$position = mb_strpos( $text, $open );
-	$text     = str_replace( $markers, '', $text );
+	// Position of the link in the sentence, in characters.
+	$lead     = strlen( $text ) - strlen( ltrim( $text ) );
+	$text     = trim( $text );
+	$position = mb_strlen( substr( $text, 0, max( 0, $from - $start - $lead ) ), 'UTF-8' );
 
 	if ( mb_strlen( $text ) <= SEORYCO_WPMD_CONTEXT_LENGTH ) {
 		return $text;
 	}
 
 	// Keep the link inside the window when it is far into a long sentence.
-	$start = 0;
-	if ( false !== $position ) {
-		$center = $position + (int) floor( mb_strlen( seoryco_wpmd_ability_clean_text( $inside ) ) / 2 );
-		$start  = max( 0, min( $center - (int) floor( SEORYCO_WPMD_CONTEXT_LENGTH / 2 ), mb_strlen( $text ) - SEORYCO_WPMD_CONTEXT_LENGTH ) );
-	}
+	$center = $position + (int) floor( mb_strlen( seoryco_wpmd_ability_clean_text( $inside ) ) / 2 );
+	$start  = max( 0, min( $center - (int) floor( SEORYCO_WPMD_CONTEXT_LENGTH / 2 ), mb_strlen( $text ) - SEORYCO_WPMD_CONTEXT_LENGTH ) );
 
 	return mb_substr( $text, $start, SEORYCO_WPMD_CONTEXT_LENGTH );
 }
