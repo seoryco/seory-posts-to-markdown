@@ -14,7 +14,7 @@ Export posts, pages, and custom post types as Markdown files with YAML front mat
 
 Seory Posts to Markdown converts your site content into clean Markdown files and bundles them into a single ZIP archive — ready to hand to AI tools, static site generators, or any Markdown-based workflow.
 
-**Runs on your server.** This plugin does not send your content to external services — no API keys, no accounts. (In the rendered content mode, WordPress applies the same content filters as when a post is displayed, so embeds, your theme, or other plugins may contact external services. See the FAQ.)
+**Runs on your server.** No API keys, no accounts, and no external service of its own. With the raw content mode, conversion contacts no external service. With the rendered content mode of the ZIP export, WordPress applies the same content filters as when a post is displayed, so embeds (oEmbed), your theme, or other plugins may contact external services. See the FAQ.
 
 = Features =
 
@@ -47,9 +47,11 @@ A browser-based version (convert a WordPress export XML without installing anyth
 
 = Is my content sent anywhere? =
 
-This plugin never sends your content to its developer or to any external service. Conversion runs on your own server, and the generated ZIP is deleted right after download.
+This plugin does not send your content to its developer, and it has no external service of its own. Conversion runs on your own server, and the generated ZIP is deleted right after download. Whether anything else contacts an external service depends on the content mode:
 
-One caveat applies to the *rendered content* mode (the ZIP export option and `get-post-markdown` with `mode=rendered`): it runs the `the_content` filters exactly as when a post is displayed. If a post contains an embeddable URL on its own line (for example a YouTube link), WordPress's oEmbed feature may request the embed code from that provider and cache it in post meta, and your theme or other plugins hooked into `the_content` may make their own requests. The *raw editor content* mode does not run these filters. `list-external-links` turns oEmbed off while it scans, so it makes no oEmbed requests and does not write the oEmbed cache.
+* *Raw editor content* (ZIP export, and `get-post-markdown` with `mode=raw`): the `the_content` filters are not run, so conversion contacts no external service.
+* *Rendered content* in the ZIP export: the `the_content` filters run exactly as when a post is displayed. If a post contains an embeddable URL on its own line (for example a YouTube link), WordPress's oEmbed feature may request the embed code from that provider and cache it in post meta, and your theme or other plugins hooked into `the_content` may make their own requests.
+* *Abilities* (`get-post-markdown` with `mode=rendered`, and `list-external-links`): oEmbed is turned off while they render, so they make no oEmbed requests and do not write the oEmbed cache; embeds stay as plain URLs. Requests made by your theme or other plugins inside `the_content` are not blocked.
 
 = What is the difference between the two content modes? =
 
@@ -77,7 +79,7 @@ Values must be YAML-formatted; keys with an empty-string value are omitted.
 
 = Can AI tools access my content directly? =
 
-Yes, optionally. Starting with version 0.2, on WordPress 6.9+ this plugin registers read-only WordPress Abilities (`wp_register_ability()`) for listing posts, fetching a single post as Markdown, and listing external links. AI tools and agents (such as Claude Code or Codex) can call these through WordPress's own REST endpoint (`/wp-json/wp-abilities/v1/abilities/...`) using an Application Password — the same authentication method used by the standard WordPress REST API. Nothing is sent to this plugin's developer or any third party; the request comes *from* the AI tool *to* your own site, exactly like any other REST API client. We recommend creating a dedicated WordPress user with limited capabilities for this purpose.
+Yes, optionally. Starting with version 0.2, on WordPress 6.9+ this plugin registers read-only WordPress Abilities (`wp_register_ability()`) for listing posts, fetching a single post as Markdown, and listing external links. AI tools and agents (such as Claude Code or Codex) can call these through WordPress's own REST endpoint (`/wp-json/wp-abilities/v1/abilities/...`) using an Application Password — the same authentication method used by the standard WordPress REST API. The request comes *from* the AI tool *to* your own site, exactly like any other REST API client; this plugin does not push your content to its developer or to any other service (see "Is my content sent anywhere?" for what rendering may contact). We recommend creating a dedicated WordPress user with limited capabilities for this purpose.
 
 If you also install the third-party MCP Adapter plugin, these abilities can be exposed as MCP tools as well. MCP Adapter is not bundled with this plugin.
 
@@ -87,10 +89,12 @@ All abilities are read-only and are called with GET, passing input as `input[...
 
 * `seoryco-wpmd/list-posts` — posts modified after a given time (`modified_after`, e.g. `2026-09-01T00:00:00Z`), oldest change first
 * `seoryco-wpmd/list-post-ids` — every post ID with its status and modified time, including trashed items, in ID order, for detecting deletions
-* `seoryco-wpmd/get-post-markdown` — one post as Markdown with front matter, the same format as a file in the ZIP export
-* `seoryco-wpmd/list-external-links` — links to other domains with anchor text, rel, target, and surrounding text
+* `seoryco-wpmd/get-post-markdown` — one post as Markdown with front matter, the same format as a file in the ZIP export (with `mode=rendered`, embeds are not fetched and stay as plain URLs)
+* `seoryco-wpmd/list-external-links` — links to other domains with anchor text, rel, target, and surrounding text. At most 200 links are listed per post (`truncated`), and only the first 1 MB of each post's rendered HTML is scanned (`content_truncated`, `content_truncated_post_ids`; developers can change the size with the `seoryco_wpmd_links_max_html_bytes` filter)
 
 The list abilities are paged with cursors: pass `next_cursor` (list-posts, list-external-links) or `next_after_id` (list-post-ids) from one response as `cursor` / `after_id` in the next request, with the other input unchanged, until it is `null`. Posts edited or deleted while you page through do not cause others to be skipped.
+
+"Modified time" is the effective modified time: `post_modified_gmt`, or, when that is `0000-00-00 00:00:00` (drafts inserted directly by some importers), `post_modified` converted to GMT with the site's current UTC offset. Known limitation: if the site's time zone switches between daylight saving and standard time while you page through `list-posts` or `list-external-links`, such posts can move by an hour and be missed in that run. A periodic full comparison with `list-post-ids` (for example monthly) picks them up.
 
 Permissions are checked at two levels:
 
@@ -108,8 +112,9 @@ Password-protected posts are never returned as Markdown or scanned for links.
 = 0.2 =
 * New: read-only WordPress Abilities for AI tools — list-posts, list-post-ids, get-post-markdown, and list-external-links (WordPress 6.9+).
 * New: `seoryco_wpmd_ability_permission` filter to adjust who can run the abilities.
+* New: `seoryco_wpmd_links_max_html_bytes` filter for the per-post HTML size that `list-external-links` scans (default 1 MB).
 * Changed: requires WordPress 6.9 or later.
-* Changed: clarified that the rendered content mode can trigger embeds (oEmbed), theme, or plugin requests, as when a post is displayed.
+* Changed: clarified that the rendered content mode of the ZIP export can trigger embeds (oEmbed), theme, or plugin requests, as when a post is displayed. The abilities turn oEmbed off while they render.
 * The ZIP export works as before.
 
 = 0.1 =

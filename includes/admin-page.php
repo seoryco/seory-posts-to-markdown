@@ -95,7 +95,7 @@ function seoryco_wpmd_render_admin_page() {
 	<div class="wrap seoryco-wpmd">
 		<h1><?php esc_html_e( 'Seory Posts to Markdown', 'seory-posts-to-markdown' ); ?></h1>
 		<p class="description seoryco-wpmd-intro">
-			<?php esc_html_e( 'Export posts, pages, and custom post types as Markdown files with YAML front matter, bundled into a ZIP archive. Conversion runs on this server; this plugin does not send your content to external services.', 'seory-posts-to-markdown' ); ?>
+			<?php esc_html_e( 'Export posts, pages, and custom post types as Markdown files with YAML front matter, bundled into a ZIP archive. Conversion runs on this server. In raw mode, no external services are contacted; in rendered mode, embeds (oEmbed), your theme, or other plugins may contact them, as when a post is displayed.', 'seory-posts-to-markdown' ); ?>
 		</p>
 
 		<form id="seoryco-wpmd-form" onsubmit="return false;">
@@ -262,7 +262,7 @@ function seoryco_wpmd_render_admin_page() {
 		<div class="seoryco-wpmd-card seoryco-wpmd-note">
 			<h2><?php esc_html_e( 'Security and behavior', 'seory-posts-to-markdown' ); ?></h2>
 			<p>
-				<?php esc_html_e( 'Conversion runs on this server, and this plugin does not send your content to external services. In rendered mode, embeds (oEmbed), your theme, or other plugins may contact external services, as when a post is displayed. Images are not downloaded — image URLs remain as Markdown references. script, style, and noscript elements are removed from the output.', 'seory-posts-to-markdown' ); ?>
+				<?php esc_html_e( 'Conversion runs on this server, and this plugin has no external service of its own. In raw mode, conversion makes no external requests. In rendered mode, embeds (oEmbed), your theme, or other plugins may contact external services, as when a post is displayed. Images are not downloaded — image URLs remain as Markdown references. script, style, and noscript elements are removed from the output.', 'seory-posts-to-markdown' ); ?>
 			</p>
 		</div>
 	</div>
