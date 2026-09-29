@@ -16,6 +16,11 @@
  * - 6.9 does not catch exceptions thrown by callbacks, so execute callbacks
  *   catch them and return a WP_Error.
  *
+ * Read-only in practice, too: while an ability renders content (list-external-links,
+ * get-post-markdown), oEmbed is suspended so no embed provider is contacted and the
+ * oEmbed cache is not written (see seoryco_wpmd_ability_without_oembed()). The
+ * ZIP export in the admin screen is not affected.
+ *
  * Access control (see docs/spec-v0.2-abilities.md §4.5):
  * - A request-level gate (`read` for published-only requests, `edit_others_posts`
  *   otherwise, filterable with `seoryco_wpmd_ability_permission`).
@@ -36,6 +41,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 define( 'SEORYCO_WPMD_ABILITY_CATEGORY', 'content-export' );
 define( 'SEORYCO_WPMD_LINKS_PER_POST', 200 );
 define( 'SEORYCO_WPMD_CONTEXT_LENGTH', 200 );
+define( 'SEORYCO_WPMD_MAX_HTML_BYTES', 1048576 );
 
 /**
  * Register the ability category.
@@ -101,7 +107,7 @@ function seoryco_wpmd_register_abilities() {
 	$modified_after_property = array(
 		'type'        => 'string',
 		'format'      => 'date-time',
-		'description' => __( 'Datetime in GMT, e.g. 2026-09-01T00:00:00Z (a MySQL-style "YYYY-MM-DD HH:MM:SS" is also accepted). Only posts with post_modified_gmt greater than this value are returned.', 'seory-posts-to-markdown' ),
+		'description' => __( 'Datetime in GMT, e.g. 2026-09-01T00:00:00Z (a MySQL-style "YYYY-MM-DD HH:MM:SS" is also accepted). Only posts whose effective modified time (post_modified_gmt, or post_modified converted to GMT when post_modified_gmt is 0000-00-00 00:00:00) is later than this value are returned.', 'seory-posts-to-markdown' ),
 	);
 
 	$cursor_property = array(
@@ -176,7 +182,7 @@ function seoryco_wpmd_register_abilities() {
 		'seoryco-wpmd/list-post-ids',
 		array(
 			'label'               => __( 'List all post IDs with status and modified time', 'seory-posts-to-markdown' ),
-			'description'         => __( 'Lightweight listing of ID, status, and post_modified_gmt for every post of the given types that the current user can read or edit, including trashed items, in ascending ID order. Intended for detecting deletions, trashing, and unpublishing by diffing against a previously saved list — not for content sync (use list-posts for that).', 'seory-posts-to-markdown' ),
+			'description'         => __( 'Lightweight listing of ID, status, and effective modified time (post_modified_gmt, or post_modified converted to GMT when post_modified_gmt is 0000-00-00 00:00:00) for every post of the given types that the current user can read or edit, including trashed items, in ascending ID order. Intended for detecting deletions, trashing, and unpublishing by diffing against a previously saved list — not for content sync (use list-posts for that).', 'seory-posts-to-markdown' ),
 			'category'            => SEORYCO_WPMD_ABILITY_CATEGORY,
 			'input_schema'        => array(
 				'type'                 => 'object',
@@ -235,7 +241,7 @@ function seoryco_wpmd_register_abilities() {
 		'seoryco-wpmd/get-post-markdown',
 		array(
 			'label'               => __( 'Get one post as Markdown with front matter', 'seory-posts-to-markdown' ),
-			'description'         => __( 'Converts a single post to Markdown with YAML front matter, reusing the same conversion used by the ZIP export. Choose raw (stored content) or rendered (the_content filters applied, shortcodes/blocks expanded).', 'seory-posts-to-markdown' ),
+			'description'         => __( 'Converts a single post to Markdown with YAML front matter, reusing the same conversion used by the ZIP export. Choose raw (stored content) or rendered (the_content filters applied, shortcodes/blocks expanded). In rendered mode, embeds (oEmbed) are not fetched, so each embed stays as its plain URL.', 'seory-posts-to-markdown' ),
 			'category'            => SEORYCO_WPMD_ABILITY_CATEGORY,
 			'input_schema'        => array(
 				'type'                 => 'object',
@@ -298,7 +304,7 @@ function seoryco_wpmd_register_abilities() {
 			'output_schema'       => array(
 				'type'       => 'object',
 				'properties' => array(
-					'items'       => array(
+					'items'                      => array(
 						'type'  => 'array',
 						'items' => array(
 							'type'       => 'object',
@@ -327,11 +333,20 @@ function seoryco_wpmd_register_abilities() {
 							'required'   => array( 'url', 'source_post_id' ),
 						),
 					),
-					'per_page'    => array( 'type' => 'integer' ),
-					'next_cursor' => $next_cursor_property,
-					'truncated'   => array(
+					'per_page'                   => array( 'type' => 'integer' ),
+					'next_cursor'                => $next_cursor_property,
+					'truncated'                  => array(
 						'type'        => 'boolean',
 						'description' => __( 'true if any post\'s link count was cut off by the per-post link cap.', 'seory-posts-to-markdown' ),
+					),
+					'content_truncated'          => array(
+						'type'        => 'boolean',
+						'description' => __( 'true if the rendered HTML of any post was larger than the size limit, so only its first part was scanned. Links after that point are not listed.', 'seory-posts-to-markdown' ),
+					),
+					'content_truncated_post_ids' => array(
+						'type'        => 'array',
+						'items'       => array( 'type' => 'integer' ),
+						'description' => __( 'IDs of the posts whose rendered HTML was only partly scanned because of the size limit.', 'seory-posts-to-markdown' ),
 					),
 				),
 			),
@@ -1140,8 +1155,14 @@ function seoryco_wpmd_ability_get_post_markdown( $input = null ) {
 			);
 		}
 
-		$used_paths = array();
-		$file       = $exporter->convert_post( $args['id'], $used_paths );
+		// A read-only GET must not fetch embeds or write the oEmbed cache (the ZIP export is not affected).
+		$file = seoryco_wpmd_ability_without_oembed(
+			static function () use ( $exporter, $args ) {
+				$used_paths = array();
+
+				return $exporter->convert_post( $args['id'], $used_paths );
+			}
+		);
 		if ( is_wp_error( $file ) ) {
 			return new WP_Error(
 				'seoryco_wpmd_not_found',
@@ -1201,51 +1222,62 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
 
 		$exporter  = new Seoryco_Wpmd_Exporter( seoryco_wpmd_ability_exporter_options( 'rendered' ) );
 		$site_host = seoryco_wpmd_ability_normalize_host( (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
-		$items     = array();
-		$truncated = false;
+		$max_bytes = seoryco_wpmd_ability_max_html_bytes();
 
 		// A GET that lists links must not fetch embeds or write the oEmbed cache.
-		$suspended = seoryco_wpmd_ability_suspend_oembed();
-		try {
-			foreach ( $result['posts'] as $post ) {
-				if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
-					continue;
+		$scan = seoryco_wpmd_ability_without_oembed(
+			static function () use ( $result, $exporter, $site_host, $max_bytes ) {
+				$scan = array(
+					'items'                      => array(),
+					'truncated'                  => false,
+					'content_truncated_post_ids' => array(),
+				);
+
+				foreach ( $result['posts'] as $post ) {
+					if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
+						continue;
+					}
+
+					// Password-protected content is never exposed (same rule as get-post-markdown).
+					if ( post_password_required( $post ) ) {
+						continue;
+					}
+
+					$found = seoryco_wpmd_ability_extract_links( $exporter->get_content_html( $post ), $site_host, SEORYCO_WPMD_LINKS_PER_POST, $max_bytes );
+					if ( $found['truncated'] ) {
+						$scan['truncated'] = true;
+					}
+					if ( $found['content_truncated'] ) {
+						$scan['content_truncated_post_ids'][] = (int) $post->ID;
+					}
+
+					$post_link = get_permalink( $post );
+					foreach ( $found['links'] as $link ) {
+						$scan['items'][] = array(
+							'url'              => $link['url'],
+							'source_post_id'   => (int) $post->ID,
+							'source_post_link' => $post_link ? (string) $post_link : '',
+							'anchor_text'      => $link['anchor_text'],
+							'rel'              => $link['rel'],
+							'target'           => $link['target'],
+							'context'          => $link['context'],
+						);
+					}
 				}
 
-				// Password-protected content is never exposed (same rule as get-post-markdown).
-				if ( post_password_required( $post ) ) {
-					continue;
-				}
-
-				$found = seoryco_wpmd_ability_extract_links( $exporter->get_content_html( $post ), $site_host, SEORYCO_WPMD_LINKS_PER_POST );
-				if ( $found['truncated'] ) {
-					$truncated = true;
-				}
-
-				$post_link = get_permalink( $post );
-				foreach ( $found['links'] as $link ) {
-					$items[] = array(
-						'url'              => $link['url'],
-						'source_post_id'   => (int) $post->ID,
-						'source_post_link' => $post_link ? (string) $post_link : '',
-						'anchor_text'      => $link['anchor_text'],
-						'rel'              => $link['rel'],
-						'target'           => $link['target'],
-						'context'          => $link['context'],
-					);
-				}
+				return $scan;
 			}
-		} finally {
-			seoryco_wpmd_ability_restore_oembed( $suspended );
-		}
+		);
 
 		$last = end( $result['posts'] );
 
 		return array(
-			'items'       => $items,
-			'per_page'    => (int) $args['per_page'],
-			'next_cursor' => ( $result['has_more'] && $last ) ? seoryco_wpmd_ability_make_cursor( $last ) : null,
-			'truncated'   => $truncated,
+			'items'                      => $scan['items'],
+			'per_page'                   => (int) $args['per_page'],
+			'next_cursor'                => ( $result['has_more'] && $last ) ? seoryco_wpmd_ability_make_cursor( $last ) : null,
+			'truncated'                  => $scan['truncated'],
+			'content_truncated'          => ! empty( $scan['content_truncated_post_ids'] ),
+			'content_truncated_post_ids' => $scan['content_truncated_post_ids'],
 		);
 	} catch ( Throwable $e ) {
 		return seoryco_wpmd_ability_exception_error( $e );
@@ -1254,61 +1286,141 @@ function seoryco_wpmd_ability_list_external_links( $input = null ) {
 
 /*
  * -------------------------------------------------------------------------
- * oEmbed suspension (list-external-links only)
+ * oEmbed suspension (list-external-links and get-post-markdown)
  * -------------------------------------------------------------------------
  */
 
 /**
- * Turn off oEmbed while list-external-links renders content.
+ * Shared state of the oEmbed suspension: nesting depth and the WP_Embed
+ * filters removed by the outermost call.
  *
+ * @return array { depth: int, removed: array, embed_shortcode: callable|null }
+ */
+function &seoryco_wpmd_ability_oembed_state() {
+	static $state = array(
+		'depth'           => 0,
+		'removed'         => array(),
+		'embed_shortcode' => null,
+	);
+
+	return $state;
+}
+
+/**
+ * Run a callback with oEmbed turned off, and turn it back on afterwards.
+ *
+ * Used by every ability that renders content (list-external-links, and
+ * get-post-markdown), so that a read-only GET neither contacts oEmbed providers
+ * nor writes the oEmbed cache. Calls may nest (for example when another plugin's
+ * `the_content` filter runs an ability while one is already rendering): only the
+ * outermost call turns oEmbed back on, also when the callback throws.
+ *
+ * @param callable $callback Callback.
+ * @return mixed The callback's return value.
+ */
+function seoryco_wpmd_ability_without_oembed( callable $callback ) {
+	try {
+		seoryco_wpmd_ability_suspend_oembed();
+
+		return $callback();
+	} finally {
+		seoryco_wpmd_ability_restore_oembed();
+	}
+}
+
+/**
+ * Turn off oEmbed (nestable; see seoryco_wpmd_ability_without_oembed()).
+ *
+ * On the outermost call:
  * - Removes WP_Embed's `the_content` filters (run_shortcode, autoembed), which
  *   are the normal path for embeds in post content.
  * - Short-circuits any remaining oEmbed request (e.g. core blocks that call
  *   WP_Embed::autoembed() or wp_oembed_get() directly), so no HTTP request is made.
  * - Blocks writes of `_oembed_*` post meta, so the oEmbed cache is not changed.
+ * - Points the `[embed]` shortcode (normally only a placeholder that outputs
+ *   nothing outside WP_Embed::run_shortcode()) at a handler that outputs the URL
+ *   as text, so every embed stays as its plain URL instead of disappearing.
  *
- * Always paired with seoryco_wpmd_ability_restore_oembed() in a finally block.
- *
- * @return array Removed WP_Embed filters as [ method, priority ] pairs.
+ * Inner calls only increase the depth. Every call must be paired with
+ * seoryco_wpmd_ability_restore_oembed() in a finally block.
  */
 function seoryco_wpmd_ability_suspend_oembed() {
 	global $wp_embed;
 
-	$removed = array();
+	$state = &seoryco_wpmd_ability_oembed_state();
+	++$state['depth'];
+	if ( $state['depth'] > 1 ) {
+		return;
+	}
+
+	$state['removed'] = array();
 	if ( $wp_embed instanceof WP_Embed ) {
 		foreach ( array( 'run_shortcode', 'autoembed' ) as $method ) {
 			$priority = has_filter( 'the_content', array( $wp_embed, $method ) );
 			if ( false !== $priority ) {
 				remove_filter( 'the_content', array( $wp_embed, $method ), $priority );
-				$removed[] = array( $method, $priority );
+				$state['removed'][] = array( $method, $priority );
 			}
 		}
 	}
 
+	$state['embed_shortcode'] = isset( $GLOBALS['shortcode_tags']['embed'] ) ? $GLOBALS['shortcode_tags']['embed'] : null;
+	add_shortcode( 'embed', 'seoryco_wpmd_ability_embed_as_url' );
+
 	add_filter( 'pre_oembed_result', 'seoryco_wpmd_ability_block_oembed', PHP_INT_MAX );
 	add_filter( 'update_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX, 3 );
 	add_filter( 'add_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX, 3 );
-
-	return $removed;
 }
 
 /**
- * Undo seoryco_wpmd_ability_suspend_oembed().
- *
- * @param array $removed Value returned by seoryco_wpmd_ability_suspend_oembed().
+ * Undo seoryco_wpmd_ability_suspend_oembed(). Only the outermost call restores.
  */
-function seoryco_wpmd_ability_restore_oembed( array $removed ) {
+function seoryco_wpmd_ability_restore_oembed() {
 	global $wp_embed;
+
+	$state = &seoryco_wpmd_ability_oembed_state();
+	if ( $state['depth'] < 1 ) {
+		return;
+	}
+
+	--$state['depth'];
+	if ( $state['depth'] > 0 ) {
+		return;
+	}
 
 	remove_filter( 'pre_oembed_result', 'seoryco_wpmd_ability_block_oembed', PHP_INT_MAX );
 	remove_filter( 'update_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
 	remove_filter( 'add_post_metadata', 'seoryco_wpmd_ability_block_oembed_cache', PHP_INT_MAX );
 
+	if ( null !== $state['embed_shortcode'] ) {
+		add_shortcode( 'embed', $state['embed_shortcode'] );
+	} else {
+		remove_shortcode( 'embed' );
+	}
+	$state['embed_shortcode'] = null;
+
 	if ( $wp_embed instanceof WP_Embed ) {
-		foreach ( $removed as $filter ) {
+		foreach ( $state['removed'] as $filter ) {
 			add_filter( 'the_content', array( $wp_embed, $filter[0] ), $filter[1] );
 		}
 	}
+	$state['removed'] = array();
+}
+
+/**
+ * `[embed]` shortcode while oEmbed is suspended: the URL as plain text.
+ *
+ * @param array|string $attr    Shortcode attributes.
+ * @param string       $content URL between the tags.
+ * @return string
+ */
+function seoryco_wpmd_ability_embed_as_url( $attr, $content = '' ) {
+	$url = trim( (string) $content );
+	if ( '' === $url && is_array( $attr ) && ! empty( $attr['src'] ) ) {
+		$url = trim( (string) $attr['src'] );
+	}
+
+	return esc_html( $url );
 }
 
 /**
@@ -1405,23 +1517,80 @@ function seoryco_wpmd_ability_clean_text( $text ) {
 }
 
 /**
+ * Maximum size in bytes of the rendered HTML that list-external-links parses per post.
+ *
+ * libxml's memory is not counted against PHP's memory_limit, and a node-dense
+ * document takes roughly 20-25 times its size in memory, so an unbounded post
+ * could exhaust the server's memory during a GET request. The default of 1 MB
+ * (SEORYCO_WPMD_MAX_HTML_BYTES) is several times larger than a very long article
+ * (a 30,000-character Japanese article renders to roughly 100-300 KB) while
+ * keeping the worst case to about 25 MB and a few tens of milliseconds of parsing.
+ *
+ * @return int
+ */
+function seoryco_wpmd_ability_max_html_bytes() {
+	/**
+	 * Filters the maximum size (bytes) of rendered HTML that list-external-links parses per post.
+	 *
+	 * Only the first part of a larger post is scanned, and the post is reported
+	 * in the `content_truncated_post_ids` output. Values below 1 are ignored.
+	 *
+	 * @since 0.2
+	 *
+	 * @param int $bytes Maximum size in bytes (default 1048576).
+	 */
+	$bytes = (int) apply_filters( 'seoryco_wpmd_links_max_html_bytes', SEORYCO_WPMD_MAX_HTML_BYTES );
+
+	return $bytes > 0 ? $bytes : SEORYCO_WPMD_MAX_HTML_BYTES;
+}
+
+/**
+ * Cut HTML to at most $max_bytes, at a tag boundary so no partial tag (and no
+ * partial href) is parsed.
+ *
+ * @param string $html      HTML.
+ * @param int    $max_bytes Maximum size in bytes.
+ * @return string
+ */
+function seoryco_wpmd_ability_cut_html( $html, $max_bytes ) {
+	$head = substr( $html, 0, $max_bytes );
+	$tag  = strrpos( $head, '<' );
+
+	if ( false !== $tag && $tag > 0 ) {
+		return substr( $head, 0, $tag );
+	}
+
+	// No tag boundary: cut at a character boundary instead.
+	return function_exists( 'mb_strcut' ) ? mb_strcut( $html, 0, $max_bytes, 'UTF-8' ) : $head;
+}
+
+/**
  * Extract external links (http/https to another host) from rendered HTML.
  *
- * Stops as soon as one more external link than $limit is found, so link-heavy
- * pages do not build context strings for links that would be discarded.
+ * Only the first $max_bytes of the HTML are parsed. Stops as soon as one more
+ * external link than $limit is found, so link-heavy pages do not build context
+ * strings for links that would be discarded.
  *
- * @param string $html      Rendered post HTML.
- * @param string $site_host Normalized host of the site.
- * @param int    $limit     Maximum number of links to return.
- * @return array { links: array[] (each: url, anchor_text, rel, target, context), truncated: bool }
+ * @param string   $html      Rendered post HTML.
+ * @param string   $site_host Normalized host of the site.
+ * @param int      $limit     Maximum number of links to return.
+ * @param int|null $max_bytes Maximum HTML size to parse (default: seoryco_wpmd_ability_max_html_bytes()).
+ * @return array { links: array[] (each: url, anchor_text, rel, target, context), truncated: bool, content_truncated: bool }
  */
-function seoryco_wpmd_ability_extract_links( $html, $site_host, $limit ) {
+function seoryco_wpmd_ability_extract_links( $html, $site_host, $limit, $max_bytes = null ) {
 	$result = array(
-		'links'     => array(),
-		'truncated' => false,
+		'links'             => array(),
+		'truncated'         => false,
+		'content_truncated' => false,
 	);
 
-	$html = (string) $html;
+	$html      = (string) $html;
+	$max_bytes = null === $max_bytes ? seoryco_wpmd_ability_max_html_bytes() : max( 1, (int) $max_bytes );
+	if ( strlen( $html ) > $max_bytes ) {
+		$html                        = seoryco_wpmd_ability_cut_html( $html, $max_bytes );
+		$result['content_truncated'] = true;
+	}
+
 	if ( '' === trim( $html ) || false === stripos( $html, '<a' ) ) {
 		return $result;
 	}
@@ -1492,51 +1661,117 @@ function seoryco_wpmd_ability_extract_links( $html, $site_host, $limit ) {
 /**
  * The sentence around a link, truncated to SEORYCO_WPMD_CONTEXT_LENGTH characters.
  *
+ * Only the text near the link is read (about SEORYCO_WPMD_CONTEXT_LENGTH characters
+ * on each side, within the enclosing block element), so the cost per link does not
+ * grow with the size of the paragraph. The link's own position is tracked, so a
+ * sentence that repeats the anchor text elsewhere is not picked by mistake.
+ *
  * @param DOMElement $anchor      Link element.
- * @param string     $anchor_text Cleaned anchor text.
+ * @param string     $anchor_text Cleaned anchor text (unused; kept for compatibility).
  * @return string
  */
-function seoryco_wpmd_ability_link_context( $anchor, $anchor_text ) {
+function seoryco_wpmd_ability_link_context( $anchor, $anchor_text = '' ) {
+	unset( $anchor_text );
+
 	$block_tags = array( 'p', 'li', 'td', 'th', 'dd', 'dt', 'blockquote', 'figcaption', 'caption', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'section', 'article' );
 
-	$node = $anchor->parentNode; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
-	while ( $node instanceof DOMElement && ! in_array( strtolower( $node->nodeName ), $block_tags, true ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
-		$node = $node->parentNode; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+	$block = $anchor->parentNode; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+	while ( $block instanceof DOMElement && ! in_array( strtolower( $block->nodeName ), $block_tags, true ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		$block = $block->parentNode; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
 	}
 
-	if ( ! $node instanceof DOMNode ) {
+	if ( ! $block instanceof DOMNode ) {
 		return '';
 	}
 
-	$text = seoryco_wpmd_ability_clean_text( $node->textContent ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
-	if ( '' === $text ) {
+	// Private-use characters mark where the link starts and ends.
+	$open    = "\u{E000}";
+	$close   = "\u{E001}";
+	$markers = array( $open, $close );
+	$inside  = str_replace( $markers, '', (string) $anchor->textContent ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+	$before  = str_replace( $markers, '', seoryco_wpmd_ability_context_side( $anchor, $block, true ) );
+	$after   = str_replace( $markers, '', seoryco_wpmd_ability_context_side( $anchor, $block, false ) );
+
+	$text = seoryco_wpmd_ability_clean_text( $before . $open . $inside . $close . $after );
+	if ( '' === trim( str_replace( $markers, '', $text ) ) ) {
 		return '';
 	}
 
-	// Pick the sentence that contains the anchor text.
-	if ( '' !== $anchor_text ) {
-		$sentences = preg_split( '/(?<=[。！？!?])\s*|(?<=\.)\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
-		if ( is_array( $sentences ) ) {
-			foreach ( $sentences as $sentence ) {
-				if ( false !== mb_strpos( $sentence, $anchor_text ) ) {
-					$text = trim( $sentence );
-					break;
-				}
+	// Pick the sentence(s) that contain the link.
+	$parts = preg_split( '/(?<=[。！？!?])\s*|(?<=\.)\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY | PREG_SPLIT_OFFSET_CAPTURE );
+	$from  = strpos( $text, $open );
+	$to    = strpos( $text, $close ) + strlen( $close );
+	if ( is_array( $parts ) && ! empty( $parts ) ) {
+		$start = 0;
+		$end   = strlen( $text );
+		foreach ( $parts as $part ) {
+			if ( $part[1] <= $from ) {
+				$start = $part[1];
+			}
+			if ( $part[1] < $to ) {
+				$end = $part[1] + strlen( $part[0] );
 			}
 		}
+		$text = trim( substr( $text, $start, $end - $start ) );
 	}
+
+	$position = mb_strpos( $text, $open );
+	$text     = str_replace( $markers, '', $text );
 
 	if ( mb_strlen( $text ) <= SEORYCO_WPMD_CONTEXT_LENGTH ) {
 		return $text;
 	}
 
-	// Keep the anchor text inside the window when it is far into a long sentence.
-	$start    = 0;
-	$position = '' !== $anchor_text ? mb_strpos( $text, $anchor_text ) : false;
+	// Keep the link inside the window when it is far into a long sentence.
+	$start = 0;
 	if ( false !== $position ) {
-		$center = $position + (int) floor( mb_strlen( $anchor_text ) / 2 );
+		$center = $position + (int) floor( mb_strlen( seoryco_wpmd_ability_clean_text( $inside ) ) / 2 );
 		$start  = max( 0, min( $center - (int) floor( SEORYCO_WPMD_CONTEXT_LENGTH / 2 ), mb_strlen( $text ) - SEORYCO_WPMD_CONTEXT_LENGTH ) );
 	}
 
 	return mb_substr( $text, $start, SEORYCO_WPMD_CONTEXT_LENGTH );
+}
+
+/**
+ * Raw text on one side of a link, within its block element, up to about
+ * SEORYCO_WPMD_CONTEXT_LENGTH characters (plus slack for whitespace that is
+ * collapsed later).
+ *
+ * @param DOMNode $anchor Link element.
+ * @param DOMNode $block  Enclosing block element.
+ * @param bool    $before true for the text before the link, false for after.
+ * @return string
+ */
+function seoryco_wpmd_ability_context_side( $anchor, $block, $before ) {
+	$want   = SEORYCO_WPMD_CONTEXT_LENGTH;
+	$pieces = array();
+	$length = 0;
+	$node   = $anchor;
+
+	while ( $node instanceof DOMNode && ! $node->isSameNode( $block ) ) {
+		$sibling = $before ? $node->previousSibling : $node->nextSibling; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		while ( $sibling instanceof DOMNode ) {
+			$text     = (string) $sibling->textContent; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+			$pieces[] = $text;
+			$length  += mb_strlen( seoryco_wpmd_ability_clean_text( $text ) );
+			if ( $length >= $want ) {
+				break 2;
+			}
+			$sibling = $before ? $sibling->previousSibling : $sibling->nextSibling; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		}
+		$node = $node->parentNode; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+	}
+
+	if ( $before ) {
+		$pieces = array_reverse( $pieces );
+	}
+	$text = implode( '', $pieces );
+
+	// A single huge text node: keep only the part next to the link.
+	$slack = $want * 8;
+	if ( mb_strlen( $text ) > $slack ) {
+		$text = $before ? mb_substr( $text, -$slack ) : mb_substr( $text, 0, $slack );
+	}
+
+	return $text;
 }
