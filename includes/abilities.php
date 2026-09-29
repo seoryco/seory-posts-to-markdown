@@ -1533,34 +1533,98 @@ function seoryco_wpmd_ability_max_html_bytes() {
 	 * Filters the maximum size (bytes) of rendered HTML that list-external-links parses per post.
 	 *
 	 * Only the first part of a larger post is scanned, and the post is reported
-	 * in the `content_truncated_post_ids` output. Values below 1 are ignored.
+	 * in the `content_truncated_post_ids` output. Only an integer (or a string of
+	 * digits) of 1 or more is used; any other value falls back to the default.
 	 *
 	 * @since 0.2
 	 *
 	 * @param int $bytes Maximum size in bytes (default 1048576).
 	 */
-	$bytes = (int) apply_filters( 'seoryco_wpmd_links_max_html_bytes', SEORYCO_WPMD_MAX_HTML_BYTES );
+	$bytes = apply_filters( 'seoryco_wpmd_links_max_html_bytes', SEORYCO_WPMD_MAX_HTML_BYTES );
 
-	return $bytes > 0 ? $bytes : SEORYCO_WPMD_MAX_HTML_BYTES;
+	if ( is_string( $bytes ) && 1 === preg_match( '/^\s*\+?[0-9]+\s*$/', $bytes ) ) {
+		$bytes = (int) $bytes;
+	}
+
+	return ( is_int( $bytes ) && $bytes > 0 ) ? $bytes : SEORYCO_WPMD_MAX_HTML_BYTES;
 }
 
 /**
- * Cut HTML to at most $max_bytes, at a tag boundary so no partial tag (and no
+ * Cut HTML to at most $max_bytes, never inside a tag, so no partial tag (and no
  * partial href) is parsed.
+ *
+ * The first $max_bytes are scanned from the start: tags are skipped as a whole
+ * (quoted attribute values may contain `>` or `<`), as are comments and the
+ * contents of raw-text elements (script, style, and the like). If the cut falls
+ * inside a tag or comment, the HTML is cut just before its `<`; if it falls in
+ * text, it is cut there at a UTF-8 character boundary. So a link whose start tag
+ * fits in the limit is kept even when its anchor text runs past it.
  *
  * @param string $html      HTML.
  * @param int    $max_bytes Maximum size in bytes.
  * @return string
  */
 function seoryco_wpmd_ability_cut_html( $html, $max_bytes ) {
-	$head = substr( $html, 0, $max_bytes );
-	$tag  = strrpos( $head, '<' );
-
-	if ( false !== $tag && $tag > 0 ) {
-		return substr( $head, 0, $tag );
+	$html = (string) $html;
+	if ( strlen( $html ) <= $max_bytes ) {
+		return $html;
 	}
 
-	// No tag boundary: cut at a character boundary instead.
+	$head   = substr( $html, 0, $max_bytes );
+	$length = strlen( $head );
+	$raw    = array( 'script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript', 'plaintext' );
+	$pos    = 0;
+
+	while ( true ) {
+		$open = strpos( $head, '<', $pos );
+		if ( false === $open ) {
+			break; // The cut is in text.
+		}
+
+		$next = substr( $head, $open + 1, 1 );
+		if ( '!' === $next && '<!--' === substr( $head, $open, 4 ) ) {
+			$end = strpos( $head, '-->', $open + 4 );
+			if ( false === $end ) {
+				return substr( $head, 0, $open ); // The cut is inside a comment.
+			}
+			$pos = $end + 3;
+			continue;
+		}
+
+		if ( '' === $next || ! preg_match( '/[A-Za-z\/!?]/', $next ) ) {
+			$pos = $open + 1; // A "<" in text, not a tag.
+			continue;
+		}
+
+		// Find the ">" that ends this tag, skipping quoted attribute values.
+		$scan = $open + 1;
+		while ( true ) {
+			$scan += strcspn( $head, '"\'>', $scan );
+			if ( $scan >= $length ) {
+				return substr( $head, 0, $open ); // The cut is inside this tag.
+			}
+			if ( '>' === $head[ $scan ] ) {
+				break;
+			}
+			$quote = strpos( $head, $head[ $scan ], $scan + 1 );
+			if ( false === $quote ) {
+				return substr( $head, 0, $open ); // The cut is inside a quoted value.
+			}
+			$scan = $quote + 1;
+		}
+		$pos = $scan + 1;
+
+		// Raw-text elements: skip to their end tag (their content is not markup).
+		if ( preg_match( '/^<([A-Za-z]+)/', substr( $head, $open, 12 ), $name ) && in_array( strtolower( $name[1] ), $raw, true ) && '/' !== substr( $head, $scan - 1, 1 ) ) {
+			$close = stripos( $head, '</' . $name[1], $pos );
+			if ( false === $close ) {
+				return substr( $head, 0, $open ); // The cut is inside this element.
+			}
+			$pos = $close;
+		}
+	}
+
+	// The cut is in text: keep whole UTF-8 characters.
 	return function_exists( 'mb_strcut' ) ? mb_strcut( $html, 0, $max_bytes, 'UTF-8' ) : $head;
 }
 
