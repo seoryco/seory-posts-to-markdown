@@ -1574,8 +1574,9 @@ function seoryco_wpmd_ability_embed_text( $url ) {
  * Whether a URL can be written into Markdown unchanged.
  *
  * An http(s) URL without whitespace, control characters, or characters that
- * Markdown or HTML would read as markup (`<`, `>`, `"`, backtick, backslash, a
- * `](` link opener, or an HTML character reference).
+ * Markdown or HTML would read as markup (`<`, `>`, `"`, backtick, backslash,
+ * `*`, `~`, square brackets, or an HTML character reference). Other URLs go
+ * through the converter's normal escaping instead.
  *
  * @param string $url URL.
  * @return bool
@@ -1583,7 +1584,7 @@ function seoryco_wpmd_ability_embed_text( $url ) {
 function seoryco_wpmd_ability_is_plain_url( $url ) {
 	$url = (string) $url;
 
-	return 1 === preg_match( '#^https?://[^\s<>"`\\\\\x00-\x1F\x7F]+$#iu', $url )
+	return 1 === preg_match( '#^https?://[^\s<>"`\\\\*~\[\]\x00-\x1F\x7F]+$#iu', $url )
 		&& false === strpos( $url, '](' )
 		&& 1 !== preg_match( '/&(?:[a-z][a-z0-9]*|#[0-9]+|#x[0-9a-f]+);/i', $url );
 }
