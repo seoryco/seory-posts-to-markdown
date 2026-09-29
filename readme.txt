@@ -8,13 +8,13 @@ Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Export posts, pages, and custom post types as Markdown files with YAML front matter, bundled into a ZIP. AI-ready, no external services.
+Export posts, pages, and custom post types as Markdown files with YAML front matter, bundled into a ZIP. AI-ready, no external service required.
 
 == Description ==
 
 Seory Posts to Markdown converts your site content into clean Markdown files and bundles them into a single ZIP archive — ready to hand to AI tools, static site generators, or any Markdown-based workflow.
 
-**Everything runs on your server.** No data is sent to external services, no API keys, no accounts.
+**Runs on your server.** This plugin does not send your content to external services — no API keys, no accounts. (In the rendered content mode, WordPress applies the same content filters as when a post is displayed, so embeds, your theme, or other plugins may contact external services. See the FAQ.)
 
 = Features =
 
@@ -47,7 +47,9 @@ A browser-based version (convert a WordPress export XML without installing anyth
 
 = Is my content sent anywhere? =
 
-No. Conversion runs entirely on your own server, and the generated ZIP is deleted right after download.
+This plugin never sends your content to its developer or to any external service. Conversion runs on your own server, and the generated ZIP is deleted right after download.
+
+One caveat applies to the *rendered content* mode (the ZIP export option and `get-post-markdown` with `mode=rendered`): it runs the `the_content` filters exactly as when a post is displayed. If a post contains an embeddable URL on its own line (for example a YouTube link), WordPress's oEmbed feature may request the embed code from that provider and cache it in post meta, and your theme or other plugins hooked into `the_content` may make their own requests. The *raw editor content* mode does not run these filters. `list-external-links` turns oEmbed off while it scans, so it makes no oEmbed requests and does not write the oEmbed cache.
 
 = What is the difference between the two content modes? =
 
@@ -55,7 +57,8 @@ No. Conversion runs entirely on your own server, and the generated ZIP is delete
 
 = Which user roles can use it? =
 
-Users with the `export` capability (administrators by default).
+* **ZIP export** (Tools → Seory Posts to Markdown): users with the `export` capability (Administrators by default).
+* **Abilities** (for AI tools, WordPress 6.9+): any logged-in user for published posts, and Editors and Administrators for other statuses, always limited to the posts that user can read or edit. See "Which abilities are available, and who can use them?" below.
 
 = Are custom post types supported? =
 
@@ -82,12 +85,19 @@ If you also install the third-party MCP Adapter plugin, these abilities can be e
 
 All abilities are read-only and are called with GET, passing input as `input[...]` query parameters:
 
-* `seoryco-wpmd/list-posts` — posts modified after a given time (`modified_after`, e.g. `2026-09-01T00:00:00Z`), paginated
-* `seoryco-wpmd/list-post-ids` — every post ID with its status and modified time, including trashed items, for detecting deletions
+* `seoryco-wpmd/list-posts` — posts modified after a given time (`modified_after`, e.g. `2026-09-01T00:00:00Z`), oldest change first
+* `seoryco-wpmd/list-post-ids` — every post ID with its status and modified time, including trashed items, in ID order, for detecting deletions
 * `seoryco-wpmd/get-post-markdown` — one post as Markdown with front matter, the same format as a file in the ZIP export
 * `seoryco-wpmd/list-external-links` — links to other domains with anchor text, rel, target, and surrounding text
 
-Requests limited to published posts need only a logged-in user (the `read` capability). Requests that include drafts, pending, scheduled, private, or trashed posts require `edit_others_posts` (Editors and Administrators by default). Password-protected posts are never returned as Markdown or scanned for links. Developers can change the required capability with the `seoryco_wpmd_ability_permission` filter.
+The list abilities are paged with cursors: pass `next_cursor` (list-posts, list-external-links) or `next_after_id` (list-post-ids) from one response as `cursor` / `after_id` in the next request, with the other input unchanged, until it is `null`. Posts edited or deleted while you page through do not cause others to be skipped.
+
+Permissions are checked at two levels:
+
+* **Per request**: requests limited to published posts need only a logged-in user (the `read` capability). Requests that include drafts, pending, scheduled, private, or trashed posts require `edit_others_posts` (Editors and Administrators by default). `list-post-ids` always requires `edit_others_posts`. Developers can change this request-level capability with the `seoryco_wpmd_ability_permission` filter.
+* **Per post**: only publicly viewable post types are served, and a post is included only if the user can read it (`read_post`, for published and private posts) or edit it (`edit_post`, for drafts, pending, scheduled, and trashed posts). Post types with their own capabilities are checked with those capabilities. The filter above cannot widen this.
+
+Password-protected posts are never returned as Markdown or scanned for links.
 
 == Screenshots ==
 
@@ -99,7 +109,8 @@ Requests limited to published posts need only a logged-in user (the `read` capab
 * New: read-only WordPress Abilities for AI tools — list-posts, list-post-ids, get-post-markdown, and list-external-links (WordPress 6.9+).
 * New: `seoryco_wpmd_ability_permission` filter to adjust who can run the abilities.
 * Changed: requires WordPress 6.9 or later.
-* The ZIP export is unchanged.
+* Changed: clarified that the rendered content mode can trigger embeds (oEmbed), theme, or plugin requests, as when a post is displayed.
+* The ZIP export works as before.
 
 = 0.1 =
 * Initial release.
