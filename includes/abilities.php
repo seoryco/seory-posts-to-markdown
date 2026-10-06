@@ -30,6 +30,9 @@
  *   cap->edit_others_posts).
  * - Per post, `read_post` (public and private statuses) or `edit_post` (all
  *   other statuses) is checked before anything about the post is returned.
+ * - get-post-markdown in raw mode also requires `edit_post`: raw content skips the
+ *   `the_content` filters that membership plugins and the like use to restrict
+ *   content (the same rule as the REST API's `content.raw`, edit context only).
  *
  * @package WP_to_Markdown
  */
@@ -252,9 +255,10 @@ function seoryco_wpmd_register_abilities() {
 						'minimum' => 1,
 					),
 					'mode' => array(
-						'type'    => 'string',
-						'enum'    => array( 'raw', 'rendered' ),
-						'default' => 'raw',
+						'type'        => 'string',
+						'enum'        => array( 'raw', 'rendered' ),
+						'default'     => 'raw',
+						'description' => __( 'raw requires permission to edit the post, because the stored content skips the content filters that may restrict access (membership plugins and the like). Use rendered to read posts you cannot edit.', 'seory-posts-to-markdown' ),
 					),
 				),
 				'required'             => array( 'id' ),
@@ -840,8 +844,14 @@ function seoryco_wpmd_ability_can_access_post( $post ) {
  *
  * Returns false for missing posts so that existence is not revealed.
  *
+ * Raw mode returns the stored content without the `the_content` filters, so
+ * restrictions that plugins apply there (membership plugins and the like) would
+ * not take effect. Like the REST API's `content.raw` (edit context only), it
+ * therefore also requires permission to edit the post. This is checked last, so
+ * the error is only returned for posts the user can already read.
+ *
  * @param mixed $input Ability input.
- * @return bool
+ * @return bool|WP_Error
  */
 function seoryco_wpmd_ability_permission_get_post_markdown( $input = null ) {
 	$args = seoryco_wpmd_ability_normalize_post_input( $input );
@@ -855,7 +865,19 @@ function seoryco_wpmd_ability_permission_get_post_markdown( $input = null ) {
 		return false;
 	}
 
-	return seoryco_wpmd_ability_can_access_post( $post );
+	if ( ! seoryco_wpmd_ability_can_access_post( $post ) ) {
+		return false;
+	}
+
+	if ( 'raw' === $args['mode'] && ! current_user_can( 'edit_post', $post->ID ) ) {
+		return new WP_Error(
+			'seoryco_wpmd_raw_not_allowed',
+			__( 'Raw mode requires permission to edit this post. Use mode "rendered" instead.', 'seory-posts-to-markdown' ),
+			array( 'status' => rest_authorization_required_code() )
+		);
+	}
+
+	return true;
 }
 
 /**
@@ -1138,7 +1160,11 @@ function seoryco_wpmd_ability_get_post_markdown( $input = null ) {
 		$args = seoryco_wpmd_ability_normalize_post_input( $input );
 
 		// Re-check right before converting, in case the post changed after the permission check.
-		if ( ! seoryco_wpmd_ability_permission_get_post_markdown( $args ) ) {
+		$permission = seoryco_wpmd_ability_permission_get_post_markdown( $args );
+		if ( is_wp_error( $permission ) ) {
+			return $permission;
+		}
+		if ( true !== $permission ) {
 			return new WP_Error(
 				'seoryco_wpmd_not_found',
 				__( 'The post could not be found.', 'seory-posts-to-markdown' ),

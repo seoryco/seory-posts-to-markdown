@@ -3,7 +3,7 @@
  * Plugin Name: Seory Posts to Markdown
  * Plugin URI: https://tools.seory.co.jp/wp-to-markdown
  * Description: Export posts, pages, and custom post types as Markdown files with YAML front matter, bundled into a ZIP archive. AI-ready output; no external service or account required.
- * Version: 0.2
+ * Version: 0.2.1
  * Author: seoryco
  * Author URI: https://seory.co.jp
  * License: GPL v2 or later
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'SEORYCO_WPMD_VERSION', '0.2' );
+define( 'SEORYCO_WPMD_VERSION', '0.2.1' );
 define( 'SEORYCO_WPMD_PLUGIN_FILE', __FILE__ );
 define( 'SEORYCO_WPMD_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SEORYCO_WPMD_PLUGIN_URL', plugin_dir_url( __FILE__ ) );

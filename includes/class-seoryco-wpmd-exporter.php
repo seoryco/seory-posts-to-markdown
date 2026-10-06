@@ -114,16 +114,18 @@ class Seoryco_Wpmd_Exporter {
 		if ( 'rendered' === $this->options['content_mode'] ) {
 			$previous = isset( $GLOBALS['post'] ) ? $GLOBALS['post'] : null;
 
-			$GLOBALS['post'] = $post; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
-			setup_postdata( $post );
+			// Restore the global post even if a filter throws, so content filters that
+			// read it (membership plugins and the like) never judge the wrong post later.
+			try {
+				$GLOBALS['post'] = $post; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+				setup_postdata( $post );
 
-			/** This filter is documented in wp-includes/post-template.php */
-			$html = apply_filters( 'the_content', $post->post_content ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Intentionally applying the core filter.
-
-			wp_reset_postdata();
-			$GLOBALS['post'] = $previous; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
-
-			return $html;
+				/** This filter is documented in wp-includes/post-template.php */
+				return apply_filters( 'the_content', $post->post_content ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Intentionally applying the core filter.
+			} finally {
+				wp_reset_postdata();
+				$GLOBALS['post'] = $previous; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+			}
 		}
 
 		// Raw mode: paragraph structure only, no shortcode/block rendering.
